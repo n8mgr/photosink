@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=photosink
+GenericName=Photo Exporter
+Comment=Export Apple Photos, OneDrive and Google Takeout into one folder tree
+Exec=photosink
+Icon=com.n8mgr.photosink
+Terminal=false
+Categories=Graphics;Photography;GTK;GNOME;
+Keywords=photos;export;takeout;onedrive;
+StartupNotify=true
+StartupWMClass=com.n8mgr.photosink

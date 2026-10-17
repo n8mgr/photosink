@@ -1,0 +1,5 @@
+bin/
+obj/
+Generated/
+.vs/
+*.user

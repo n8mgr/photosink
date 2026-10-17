@@ -1,0 +1,29 @@
+[package]
+name = "photosink-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "photosink_bridge"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+open = "5"
+photosink = { path = ".." }
+thiserror = "2"
+toml = "0.9"
+uniffi = "0.31"
+
+[dev-dependencies]
+tempfile = "3"

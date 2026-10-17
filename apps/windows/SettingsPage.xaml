@@ -1,0 +1,116 @@
+<UserControl
+    x:Class="Photosink.SettingsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Photosink"
+    xmlns:tk="using:CommunityToolkit.WinUI.Controls">
+    <ScrollViewer>
+        <StackPanel MaxWidth="1000" Padding="24,0,24,24" Spacing="4">
+            <TextBlock Margin="0,12,0,12" Style="{StaticResource TitleTextBlockStyle}" Text="Settings" />
+            <InfoBar x:Name="ErrorBar" Severity="Error" IsOpen="False" />
+
+            <StackPanel x:Name="Body" Spacing="4">
+                <tk:SettingsCard x:Name="ExportCard" Header="Export folder">
+                    <tk:SettingsCard.HeaderIcon>
+                        <FontIcon Glyph="&#xE8B7;" />
+                    </tk:SettingsCard.HeaderIcon>
+                    <Button x:Name="ExportDirBrowse" Content="Choose…" />
+                </tk:SettingsCard>
+
+                <tk:SettingsExpander x:Name="LayoutExpander" Header="Layout">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE8A9;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard Header="Folder" ContentAlignment="Vertical" HorizontalContentAlignment="Stretch">
+                            <tk:SettingsCard.Description>
+                                <local:TemplatePreview x:Name="FolderPreview" />
+                            </tk:SettingsCard.Description>
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="FolderBox" FontFamily="{StaticResource MonoFont}" IsSpellCheckEnabled="False" />
+                                <DropDownButton x:Name="FolderInsert" Grid.Column="1" Content="Insert field" />
+                            </Grid>
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Filename" ContentAlignment="Vertical" HorizontalContentAlignment="Stretch">
+                            <tk:SettingsCard.Description>
+                                <local:TemplatePreview x:Name="FilenamePreview" />
+                            </tk:SettingsCard.Description>
+                            <Grid ColumnSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="FilenameBox" FontFamily="{StaticResource MonoFont}" IsSpellCheckEnabled="False" />
+                                <DropDownButton x:Name="FilenameInsert" Grid.Column="1" Content="Insert field" />
+                            </Grid>
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
+
+                <tk:SettingsExpander x:Name="DatesExpander" Header="Dates">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE787;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard x:Name="DateSourceCard" Header="Taken date">
+                            <ComboBox x:Name="DateSourceBox" MinWidth="220" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard x:Name="ZoneCard" Header="Folder clock">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <TextBox x:Name="OffsetBox" Width="96" FontFamily="{StaticResource MonoFont}" IsSpellCheckEnabled="False" />
+                                <ComboBox x:Name="ZoneBox" MinWidth="220" />
+                            </StackPanel>
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
+
+                <tk:SettingsExpander x:Name="FilterExpander" Header="Filter">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE71C;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.ItemsHeader>
+                        <InfoBar x:Name="FilterHint" IsClosable="False" IsOpen="True" Severity="Informational" />
+                    </tk:SettingsExpander.ItemsHeader>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard Header="Media">
+                            <ComboBox x:Name="MediaBox" MinWidth="220" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard x:Name="FavoritesCard">
+                            <ToggleSwitch x:Name="FavoritesSwitch" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Taken between">
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <CalendarDatePicker x:Name="FromPicker" DateFormat="{}{year.full}-{month.integer(2)}-{day.integer(2)}" PlaceholderText="From" />
+                                <CalendarDatePicker x:Name="ToPicker" DateFormat="{}{year.full}-{month.integer(2)}-{day.integer(2)}" PlaceholderText="To" />
+                            </StackPanel>
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Albums">
+                            <TextBox x:Name="AlbumsBox" Width="320" IsSpellCheckEnabled="False" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Keywords">
+                            <TextBox x:Name="KeywordsBox" Width="320" IsSpellCheckEnabled="False" />
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
+
+                <tk:SettingsExpander x:Name="FilesExpander" Header="Files">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE8A5;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard x:Name="EditsCard" Header="Export">
+                            <ComboBox x:Name="EditsBox" MinWidth="220" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard x:Name="MetadataCard" Header="Metadata">
+                            <ComboBox x:Name="MetadataBox" MinWidth="220" />
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

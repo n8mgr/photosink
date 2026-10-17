@@ -1,0 +1,17 @@
+[package]
+name = "photosink-gtk"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+edition = "2024"
+
+[workspace]
+
+[[bin]]
+name = "photosink"
+path = "src/main.rs"
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
+async-channel = "2"
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+photosink-bridge = { path = "../../bridge" }

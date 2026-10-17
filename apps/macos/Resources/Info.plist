@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Photosink</string>
+	<key>CFBundleDisplayName</key>
+	<string>Photosink</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.n8mgr.photosink</string>
+	<key>CFBundleExecutable</key>
+	<string>Photosink</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>CFBundleIconFile</key>
+	<string>icon</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Photosink reads your Photos library to export originals and metadata.</string>
+</dict>
+</plist>

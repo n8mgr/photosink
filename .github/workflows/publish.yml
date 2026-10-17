@@ -1,0 +1,234 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  # release merges get their own group so a later push can never replace a pending release
+  group: "${{ github.workflow }}-${{ contains(github.event.head_commit.message, 'chore: prepare release') && github.sha || github.ref_name }}"
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tag:
+    name: Tag Release
+    if: "contains(github.event.head_commit.message, 'chore: prepare release')"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Configure Git
+        run: |
+          git config --global user.name github-actions[bot]
+          git config --global user.email 41898282+github-actions[bot]@users.noreply.github.com
+      - uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+      - name: Tag release
+        run: knope tag --verbose
+      - name: Read version tag
+        id: version
+        run: echo "version=$(git tag --points-at HEAD --list 'v*' | head -n1)" >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: Build macOS
+    needs: tag
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      APPLE_CERT_ID: ${{ secrets.APPLE_CERT_ID }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_KEY_B64: ${{ secrets.APPLE_KEY_B64 }}
+      APPLE_CERT_B64: ${{ secrets.APPLE_CERT_B64 }}
+      APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.version }}
+      - name: Setup Rust
+        run: |
+          rustup update stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Setup signing
+        if: env.APPLE_CERT_B64 != ''
+        run: |
+          APPLE_CERT_PATH="$RUNNER_TEMP/apple_cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo -n "$APPLE_CERT_B64" | base64 --decode --output "$APPLE_CERT_PATH"
+
+          mkdir -p ~/private_keys
+          echo -n "$APPLE_KEY_B64" | base64 --decode --output ~/private_keys/"AuthKey_$APPLE_API_KEY.p8"
+
+          security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$APPLE_CERT_PATH" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security find-identity -v "$KEYCHAIN_PATH" -p codesigning
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # resync system clock https://github.com/actions/runner/issues/2996#issuecomment-1833103110
+          sudo sntp -sS time.windows.com
+      - name: Build
+        run: |
+          if [ -n "$APPLE_CERT_B64" ]; then export SIGN_IDENTITY="$APPLE_CERT_ID"; else echo "::warning::No Apple signing secrets; building ad-hoc signed"; fi
+          UNIVERSAL=1 apps/macos/build.sh
+      - name: Notarize and package
+        run: |
+          mkdir -p release
+          cd apps/macos/build
+          ZIP=$GITHUB_WORKSPACE/release/photosink_macos_universal.zip
+          if [ -n "$APPLE_CERT_B64" ]; then
+            ditto -c -k --keepParent Photosink.app notarize.zip
+            xcrun notarytool submit -k ~/private_keys/"AuthKey_$APPLE_API_KEY.p8" -d "$APPLE_API_KEY" -i "$APPLE_API_ISSUER" --wait --timeout 20m notarize.zip
+            xcrun stapler staple Photosink.app
+          fi
+          ditto -c -k --keepParent Photosink.app "$ZIP"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: photosink_macos_universal
+          path: release/*
+
+  windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: tag
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+            rid: win-x64
+    env:
+      AZURE_KEY_VAULT_URI: ${{ secrets.AZURE_KEY_VAULT_URI }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_CERT_NAME: ${{ secrets.AZURE_CERT_NAME }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.version }}
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Setup
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+          cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.1+v0.31.0 --locked
+          dotnet tool install --global AzureSignTool
+      - name: Build
+        shell: pwsh
+        run: apps/windows/build.ps1 -Target ${{ matrix.target }} -Configuration Release -Publish
+      - name: Sign
+        if: env.AZURE_KEY_VAULT_URI != ''
+        shell: bash
+        run: |
+          for file in apps/windows/bin/publish/${{ matrix.rid }}/{Photosink.exe,Photosink.dll,photosink_bridge.dll}; do
+            azuresigntool sign -kvu "$AZURE_KEY_VAULT_URI" -kvi "$AZURE_CLIENT_ID" -kvt "$AZURE_TENANT_ID" -kvs "$AZURE_CLIENT_SECRET" -kvc "$AZURE_CERT_NAME" -tr http://timestamp.digicert.com -v "$file"
+          done
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p release
+          cp README.md LICENSE apps/windows/bin/publish/${{ matrix.rid }}/
+          7z a release/photosink_windows_${{ matrix.arch }}.zip ./apps/windows/bin/publish/${{ matrix.rid }}/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: photosink_windows_${{ matrix.arch }}
+          path: release/*
+
+  linux:
+    name: Build Linux (${{ matrix.arch }})
+    needs: tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.version }}
+      - name: Setup Environment
+        run: |
+          rustup update stable
+          rustup target add ${{ matrix.target }}
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+      - name: Setup cross-compile
+        if: matrix.arch == 'aarch64'
+        run: |
+          # arm64 packages come from ports.ubuntu.com; keep the main archive amd64-only
+          sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
+          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: noble noble-updates noble-security\nComponents: main universe\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
+            | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libgtk-4-dev:arm64 libadwaita-1-dev:arm64
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
+          } >> "$GITHUB_ENV"
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path apps/linux/Cargo.toml
+      - name: Package
+        run: |
+          NAME=photosink_linux_${{ matrix.arch }}
+          mkdir -p "$NAME" release
+          cp apps/linux/target/${{ matrix.target }}/release/photosink apps/linux/photosink.desktop apps/linux/photosink.png README.md LICENSE "$NAME/"
+          tar -czf "release/$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: photosink_linux_${{ matrix.arch }}
+          path: release/*
+
+  release:
+    name: Create GitHub Release
+    needs: [tag, macos, windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.tag.outputs.version }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: photosink_*
+          path: release
+          merge-multiple: true
+      - uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+      - name: Create GitHub release
+        run: knope release --verbose
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

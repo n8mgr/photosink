@@ -1,0 +1,4 @@
+.build/
+build/
+Sources/Photosink/Generated/
+Sources/photosink_bridgeFFI/include/
