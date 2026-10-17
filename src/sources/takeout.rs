@@ -78,7 +78,8 @@ fn walk(path: &Path, mut f: impl FnMut(PathBuf, &mut dyn Read) -> Result<()>) ->
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
             if entry.is_file() {
-                f(safe_rel(entry.name()), &mut entry)?;
+                let rel = safe_rel(&entry.name()?);
+                f(rel, &mut entry)?;
             }
         }
     } else {

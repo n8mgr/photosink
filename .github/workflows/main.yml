@@ -42,6 +42,19 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --manifest-path apps/linux/Cargo.toml --all-targets -- -D warnings
 
+  deny:
+    name: Dependencies
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest: [Cargo.toml, apps/linux/Cargo.toml]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: ${{ matrix.manifest }}
+
   test:
     name: Test (${{ matrix.os }})
     strategy:
@@ -95,7 +108,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "10.0.x"
       - name: Setup Rust
         run: rustup update stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -114,7 +127,7 @@ jobs:
   # Single required check for branch protection.
   success:
     name: success
-    needs: [lint, test, macos, linux, windows]
+    needs: [lint, deny, test, macos, linux, windows]
     runs-on: ubuntu-24.04
     steps:
       - run: echo success

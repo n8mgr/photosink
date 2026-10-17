@@ -1,4 +1,6 @@
+using CommunityToolkit.WinUI.Controls;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using System;
 using System.Linq;
@@ -8,15 +10,16 @@ using uniffi.photosink_bridge;
 namespace Photosink;
 
 /// <summary>
-/// One tab: its header, its commands, its argument form and its own status
-/// rows (or, on Dates, the date picker). Each tab keeps one instance so its
-/// scroll position and filters survive switching.
+/// One tab: its header with the run button, its inputs as settings cards, and
+/// its own status rows under a results command bar (or, on Dates, the date
+/// picker). Each tab keeps one instance so its scroll position and filters
+/// survive switching.
 /// </summary>
 internal sealed partial class TabPage : Grid
 {
     private readonly Core core;
     private readonly TabInfo info;
-    private readonly WrapPanel subtitle = new() { HorizontalSpacing = 16 };
+    private readonly WrapPanel subtitle = new() { HorizontalSpacing = 16, VerticalAlignment = VerticalAlignment.Center };
     private readonly InfoBar statusBar = new() { Severity = InfoBarSeverity.Error, IsClosable = false };
     private readonly InfoBar errorBar = new() { Severity = InfoBarSeverity.Error };
     private readonly CommandBar commands = new()
@@ -27,19 +30,19 @@ internal sealed partial class TabPage : Grid
     private readonly Grid runWrap = new() { Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent) };
     private readonly Button run = new() { MinWidth = 96 };
     private readonly Button apply = new() { MinWidth = 96, Visibility = Visibility.Collapsed };
-    private readonly AppBarToggleButton dry = new() { Label = "Dry run", Icon = new FontIcon { Glyph = "" } };
+    private readonly ToggleSwitch dry = new();
     private readonly AppBarButton filter = new() { Label = "Filter", Icon = new FontIcon { Glyph = "" } };
     private readonly MenuFlyout filterMenu = new();
     private readonly AppBarButton chooseAll = new() { Label = "Choose all", Icon = new FontIcon { Glyph = "" }, Visibility = Visibility.Collapsed };
     private readonly MenuFlyout chooseMenu = new();
     private readonly AppBarToggleButton follow = new() { Label = "Follow", Icon = new FontIcon { Glyph = "" }, IsChecked = true };
     private readonly AppBarButton clear = new() { Label = "Clear", Icon = new FontIcon { Glyph = "" } };
-    private readonly StackPanel form = new() { Spacing = 8 };
+    private readonly StackPanel form = new() { Spacing = 4 };
     private readonly ContentControl formHost = new()
     {
         HorizontalContentAlignment = HorizontalAlignment.Stretch,
         IsTabStop = false,
-        Margin = new Thickness(0, 4, 0, 8),
+        Margin = new Thickness(0, 8, 0, 8),
     };
     private readonly ProgressBar progress = new() { Maximum = 1, Visibility = Visibility.Collapsed };
     private readonly ListView list = new() { SelectionMode = ListViewSelectionMode.None };
@@ -62,23 +65,33 @@ internal sealed partial class TabPage : Grid
         }
         RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
-        var header = new StackPanel { Padding = new Thickness(0, 12, 0, 4), Spacing = 2 };
-        header.Children.Add(new TextBlock { Text = info.Name, Style = Ui.Style("TitleTextBlockStyle") });
-        header.Children.Add(subtitle);
+        var heading = new StackPanel { Spacing = 2 };
+        heading.Children.Add(new TextBlock { Text = info.Name, Style = Ui.Style("TitleTextBlockStyle") });
+        heading.Children.Add(Ui.Text(info.Hint, "SecondaryText"));
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
+        buttons.Children.Add(runWrap);
+        buttons.Children.Add(apply);
+        SetColumn(buttons, 1);
+        var header = new Grid { Padding = new Thickness(0, 12, 0, 4), ColumnSpacing = 24 };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(heading);
+        header.Children.Add(buttons);
 
         var bars = new StackPanel { Spacing = 4 };
         bars.Children.Add(statusBar);
         bars.Children.Add(errorBar);
         SetRow(bars, 1);
 
-        BuildCommands();
-        SetRow(commands, 2);
-
         var args = core.RunArgs(info.Tab);
         BuildForm(args);
         formHost.Content = form;
-        SetRow(formHost, 3);
-        SetRow(progress, 4);
+        formHost.Visibility = form.Children.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        SetRow(formHost, 2);
+        SetRow(progress, 3);
+
+        BuildCommands();
+        SetRow(commands, 4);
 
         rows = new LazyList((start, count) => core.GridRows(info.Tab, (uint)start, (uint)count));
         list.ItemTemplate = (DataTemplate)Application.Current.Resources["StatusRowTemplate"];
@@ -95,9 +108,9 @@ internal sealed partial class TabPage : Grid
 
         Children.Add(header);
         Children.Add(bars);
-        Children.Add(commands);
         Children.Add(formHost);
         Children.Add(progress);
+        Children.Add(commands);
         Children.Add(list);
 
         if (info.Tab == Tab.Dates)
@@ -128,13 +141,7 @@ internal sealed partial class TabPage : Grid
                 ShowError(e.Message);
             }
         };
-        var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
-        content.Children.Add(runWrap);
-        content.Children.Add(apply);
-        commands.Content = content;
-
-        dry.Visibility = info.DryRun ? Visibility.Visible : Visibility.Collapsed;
-        dry.Click += (_, _) => EditArgs(a => a with { Dry = dry.IsChecked == true });
+        commands.Content = subtitle;
 
         filterMenu.Opening += (_, _) => BuildFilterMenu();
         filter.Flyout = filterMenu;
@@ -155,8 +162,6 @@ internal sealed partial class TabPage : Grid
             core.Clear(info.Tab);
         };
 
-        commands.PrimaryCommands.Add(dry);
-        commands.PrimaryCommands.Add(new AppBarSeparator());
         commands.PrimaryCommands.Add(filter);
         commands.PrimaryCommands.Add(chooseAll);
         commands.PrimaryCommands.Add(follow);
@@ -165,16 +170,14 @@ internal sealed partial class TabPage : Grid
 
     private void BuildForm(RunArgs args)
     {
-        dry.IsChecked = args.Dry;
         if (info.Arg is { } spec)
         {
             var box = new TextBox
             {
-                Header = spec.Label,
-                PlaceholderText = spec.Placeholder,
                 Text = args.Arg,
                 IsSpellCheckEnabled = false,
             };
+            AutomationProperties.SetName(box, spec.Label);
             box.TextChanged += (_, _) => EditArgs(a => a with { Arg = box.Text });
             box.KeyDown += (_, e) =>
             {
@@ -190,19 +193,41 @@ internal sealed partial class TabPage : Grid
             row.Children.Add(box);
             if (Browse(spec, box) is { } browse)
             {
-                browse.VerticalAlignment = VerticalAlignment.Bottom;
                 SetColumn(browse, 1);
                 row.Children.Add(browse);
             }
-            form.Children.Add(row);
+            form.Children.Add(new SettingsCard
+            {
+                Header = spec.Label,
+                Description = spec.Placeholder,
+                HeaderIcon = new FontIcon { Glyph = spec.RunOnEnter ? "\uE721" : "\uE8B7" },
+                ContentAlignment = ContentAlignment.Vertical,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Content = row,
+            });
         }
         if (info.Option is { } label)
         {
-            var toggle = new ToggleSwitch { OnContent = label, OffContent = label, IsOn = args.Option };
+            var toggle = new ToggleSwitch { IsOn = args.Option };
             toggle.Toggled += (_, _) => EditArgs(a => a with { Option = toggle.IsOn });
-            form.Children.Add(toggle);
+            form.Children.Add(new SettingsCard
+            {
+                Header = label,
+                HeaderIcon = new FontIcon { Glyph = "\uE74D" },
+                Content = toggle,
+            });
         }
-        form.Children.Add(Ui.Text(info.Hint, "SecondaryText"));
+        if (info.DryRun)
+        {
+            dry.IsOn = args.Dry;
+            dry.Toggled += (_, _) => EditArgs(a => a with { Dry = dry.IsOn });
+            form.Children.Add(new SettingsCard
+            {
+                Header = "Dry run",
+                HeaderIcon = new FontIcon { Glyph = "\uE890" },
+                Content = dry,
+            });
+        }
     }
 
     private FrameworkElement? Browse(ArgSpec spec, TextBox box)
@@ -422,7 +447,6 @@ internal sealed partial class TabPage : Grid
         statusBar.Title = next.Text;
         statusBar.IsOpen = owns && next.Error;
         formHost.IsEnabled = next.Running is null;
-        dry.IsEnabled = next.Running is null;
         RefreshTask();
         RefreshClear();
         RefreshSubtitle();

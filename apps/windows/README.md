@@ -7,8 +7,8 @@ the bridge; this app only renders what `Core` returns.
 
 - Rust with the MSVC toolchain (`rustup default stable-msvc`); for ARM64 builds also
   `rustup target add aarch64-pc-windows-msvc` and the Visual Studio ARM64 build tools.
-- .NET 8 SDK.
-- Windows App SDK 1.8 (pulled from NuGet by the build; the app is self-contained and
+- .NET 10 SDK.
+- Windows App SDK 2.5 (pulled from NuGet by the build; the app is self-contained and
   unpackaged, so no runtime install is needed).
 - uniffi-bindgen-cs matching uniffi 0.31:
 
@@ -26,5 +26,5 @@ the bridge; this app only renders what `Core` returns.
 
 `build.ps1` builds the bridge DLL, regenerates `Generated\photosink_bridge.cs`
 (gitignored) and builds the app with the DLL copied next to `Photosink.exe`.
-Run `bin\<Platform>\Release\net8.0-windows10.0.19041.0\<rid>\Photosink.exe`, or
+Run `bin\<Platform>\Release\net10.0-windows10.0.19041.0\<rid>\Photosink.exe`, or
 open `Photosink.csproj` in Visual Studio after running `build.ps1` once.

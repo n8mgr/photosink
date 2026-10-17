@@ -12,7 +12,7 @@ native app per platform over one Rust core.
 | `bridge/` | `photosink-bridge`: the window model every app renders, exported with UniFFI 0.31. Settings, tab catalogue, runs, the status grid (grouping, states, filters) and the Dates picker. |
 | `apps/macos/` | SwiftUI app (SwiftPM, macOS 26). `build.sh` builds the bridge, generates Swift bindings and assembles `build/Photosink.app`. |
 | `apps/linux/` | GTK 4 + libadwaita app; its own Cargo workspace using `bridge` as a crate. |
-| `apps/windows/` | WinUI 3 app (C#, .NET 8). `build.ps1` builds the bridge, runs `uniffi-bindgen-cs` and the .NET build. |
+| `apps/windows/` | WinUI 3 app (C#, .NET 10). `build.ps1` builds the bridge, runs `uniffi-bindgen-cs` and the .NET build. |
 | `.changeset/` | Pending changelog entries for knope. |
 
 ## Rules
@@ -41,6 +41,7 @@ native app per platform over one Rust core.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo deny check                    # licenses (GPL-3.0 compatible), advisories, sources
 
 # Linux app (needs libgtk-4-dev and libadwaita-1-dev on Linux, or brew gtk4 libadwaita)
 cargo clippy --manifest-path apps/linux/Cargo.toml --all-targets -- -D warnings
@@ -49,7 +50,7 @@ cargo clippy --manifest-path apps/linux/Cargo.toml --all-targets -- -D warnings
 apps/macos/build.sh                 # this Mac's arch, ad-hoc signed
 UNIVERSAL=1 apps/macos/build.sh     # arm64 + x86_64
 
-# Windows app (PowerShell, Rust MSVC, .NET 8 SDK, uniffi-bindgen-cs v0.11.1+v0.31.0)
+# Windows app (PowerShell, Rust MSVC, .NET 10 SDK, uniffi-bindgen-cs v0.11.1+v0.31.0)
 apps/windows/build.ps1
 ```
 

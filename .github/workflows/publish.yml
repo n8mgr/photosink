@@ -86,18 +86,19 @@ jobs:
         run: |
           if [ -n "$APPLE_CERT_B64" ]; then export SIGN_IDENTITY="$APPLE_CERT_ID"; else echo "::warning::No Apple signing secrets; building ad-hoc signed"; fi
           UNIVERSAL=1 apps/macos/build.sh
-      - name: Notarize and package
+      - name: Package, sign and notarize
         run: |
-          mkdir -p release
-          cd apps/macos/build
-          ZIP=$GITHUB_WORKSPACE/release/photosink_macos_universal.zip
+          mkdir -p release dmg
+          DMG=$GITHUB_WORKSPACE/release/photosink_macos_universal.dmg
+          ditto apps/macos/build/Photosink.app dmg/Photosink.app
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname Photosink -srcfolder dmg -fs HFS+ -format UDZO -ov "$DMG"
           if [ -n "$APPLE_CERT_B64" ]; then
-            ditto -c -k --keepParent Photosink.app notarize.zip
-            xcrun notarytool submit -k ~/private_keys/"AuthKey_$APPLE_API_KEY.p8" -d "$APPLE_API_KEY" -i "$APPLE_API_ISSUER" --wait --timeout 20m notarize.zip
-            xcrun stapler staple Photosink.app
+            codesign --force --timestamp --sign "$APPLE_CERT_ID" "$DMG"
+            xcrun notarytool submit -k ~/private_keys/"AuthKey_$APPLE_API_KEY.p8" -d "$APPLE_API_KEY" -i "$APPLE_API_ISSUER" --wait --timeout 20m "$DMG"
+            xcrun stapler staple "$DMG"
           fi
-          ditto -c -k --keepParent Photosink.app "$ZIP"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: photosink_macos_universal
           path: release/*
@@ -127,9 +128,7 @@ jobs:
           ref: ${{ needs.tag.outputs.version }}
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
-          dotnet-version: |
-            8.0.x
-            10.0.x
+          dotnet-version: "10.0.x"
       - name: Setup
         shell: pwsh
         run: |
@@ -153,7 +152,7 @@ jobs:
           mkdir -p release
           cp README.md LICENSE apps/windows/bin/publish/${{ matrix.rid }}/
           7z a release/photosink_windows_${{ matrix.arch }}.zip ./apps/windows/bin/publish/${{ matrix.rid }}/*
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: photosink_windows_${{ matrix.arch }}
           path: release/*
@@ -206,7 +205,7 @@ jobs:
           mkdir -p "$NAME" release
           cp apps/linux/target/${{ matrix.target }}/release/photosink apps/linux/photosink.desktop apps/linux/photosink.png README.md LICENSE "$NAME/"
           tar -czf "release/$NAME.tar.gz" "$NAME"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: photosink_linux_${{ matrix.arch }}
           path: release/*

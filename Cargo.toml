@@ -3,6 +3,7 @@ name = "photosink"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+publish = false
 
 [workspace]
 members = ["bridge"]
@@ -10,27 +11,27 @@ exclude = ["apps"]
 
 [dependencies]
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 blake3 = "1"
 crc32fast = "1"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "6"
 flate2 = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 kamadak-exif = "0.6"
 open = "5"
 plist = "1"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls"] }
 reverse_geocoder = "4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tar = "0.4"
 tempfile = "3"
-toml = "0.9"
+toml = "1"
 url = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
