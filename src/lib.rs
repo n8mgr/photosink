@@ -15,12 +15,11 @@ use export::Summary;
 #[cfg(target_os = "macos")]
 use sources::apple_photos;
 use state::State;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// One step of a run, sent to the window as structured data and rendered to
-/// text for the on-disk run log.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+/// One step of a run, rendered to text for the run log.
+#[derive(Debug, Clone)]
 pub enum Event {
     Log {
         path: String,
@@ -99,13 +98,17 @@ pub enum Event {
     },
     Redated {
         stem: String,
-        from: String,
-        to: String,
+        from: Option<chrono::NaiveDateTime>,
+        to: chrono::NaiveDateTime,
     },
     Error {
         n: Option<usize>,
         total: Option<usize>,
         subject: String,
+        text: String,
+    },
+    /// Something the run did without, such as a missing source table.
+    Warning {
         text: String,
     },
 }
@@ -115,6 +118,21 @@ impl Event {
         Event::Error {
             n: None,
             total: None,
+            subject: subject.into(),
+            text: text.to_string(),
+        }
+    }
+
+    /// An error on asset `n` of `total`.
+    pub fn error_at(
+        n: usize,
+        total: usize,
+        subject: impl Into<String>,
+        text: impl std::fmt::Display,
+    ) -> Event {
+        Event::Error {
+            n: Some(n),
+            total: Some(total),
             subject: subject.into(),
             text: text.to_string(),
         }
@@ -154,16 +172,21 @@ impl std::fmt::Display for Event {
             } => write!(f, "finding {q:?} among {total} assets"),
             Event::Checking { total, query: None } => write!(f, "checking dates of {total} assets"),
             Event::Checked { n, total, flagged } => write!(f, "[{n}/{total}] {flagged} flagged"),
-            Event::Flagged(c) => write!(
-                f,
-                "{}/{}: {} (create {}, original {}, modify {})",
-                c.dir,
-                c.stem,
-                c.current.as_deref().unwrap_or("no date"),
-                c.create.as_deref().unwrap_or("-"),
-                c.original.as_deref().unwrap_or("-"),
-                c.modify.as_deref().unwrap_or("-"),
-            ),
+            Event::Flagged(c) => {
+                let at = |t: Option<chrono::NaiveDateTime>, none: &str| {
+                    t.map_or_else(|| none.to_owned(), |t| t.format(redate::FORMAT).to_string())
+                };
+                write!(
+                    f,
+                    "{}/{}: {} (create {}, original {}, modify {})",
+                    c.dir,
+                    c.stem,
+                    at(c.current, "no date"),
+                    at(c.create, "-"),
+                    at(c.original, "-"),
+                    at(c.modify, "-"),
+                )
+            }
             Event::Asset { n, total, name } => write!(f, "[{n}/{total}] {name}"),
             Event::Placed {
                 n,
@@ -184,7 +207,15 @@ impl std::fmt::Display for Event {
                 stem,
                 dest,
             } => write!(f, "[{n}/{total}] {stem} -> {dest}"),
-            Event::Redated { stem, from, to } => write!(f, "{stem}: {from} -> {to}"),
+            Event::Redated { stem, from, to } => write!(
+                f,
+                "{stem}: {} -> {}",
+                from.map_or_else(
+                    || "none".to_owned(),
+                    |t| t.format(redate::FORMAT).to_string()
+                ),
+                to.format(redate::FORMAT)
+            ),
             Event::Error {
                 n: Some(n),
                 total: Some(total),
@@ -192,49 +223,34 @@ impl std::fmt::Display for Event {
                 text,
             } => write!(f, "[{n}/{total}] {subject}: {text}"),
             Event::Error { subject, text, .. } => write!(f, "{subject}: {text}"),
+            Event::Warning { text } => write!(f, "warning: {text}"),
         }
     }
 }
 
 pub type Progress<'a> = &'a (dyn Fn(Event) + Sync);
 
-pub const DEFAULT_LIBRARY: &str = "~/Pictures/Photos Library.photoslibrary";
-
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct PathPreview {
     pub dir: String,
     pub file: String,
     pub ext: String,
     pub unknown_path: Vec<String>,
     pub unknown_filename: Vec<String>,
-    pub sample: String,
-    pub fields: Vec<photo::FieldInfo>,
 }
 
-/// Renders the folder and filename templates against `sample`, reporting
-/// unknown fields in each.
+/// Renders the folder and filename templates against `sample` read in
+/// `zone`, reporting unknown fields in each.
 pub fn preview_path(
-    cfg: Option<&Config>,
+    zone: photo::DateZone,
     path: &str,
     filename: &str,
     sample: &photo::Asset,
-    label: &str,
 ) -> PathPreview {
-    let zoned = match cfg {
-        Some(cfg) => cfg.zoned(sample),
-        None => sample.clone(),
-    };
-    let file = {
-        let s = template::render(filename, |k, i| zoned.field(k, i)).replace('/', "-");
-        if s.is_empty() {
-            template::sanitize(zoned.stem())
-        } else {
-            s
-        }
-    };
+    let zoned = sample.zoned(zone);
     PathPreview {
         dir: template::render(path, |k, i| zoned.field(k, i)),
-        file,
+        file: export::file_stem(filename, &zoned),
         ext: Path::new(&sample.filename)
             .extension()
             .and_then(|e| e.to_str())
@@ -242,13 +258,10 @@ pub fn preview_path(
             .to_owned(),
         unknown_path: template::unknown(path, &photo::field_names()),
         unknown_filename: template::unknown(filename, &photo::field_names()),
-        sample: label.to_owned(),
-        fields: photo::FIELDS.to_vec(),
     }
 }
 
-/// A progress sink that also appends every line to a file under the data
-/// directory, so nothing the window drops is lost.
+/// A run's log file, one event per line.
 pub struct RunLog {
     pub path: PathBuf,
     file: std::sync::Mutex<std::fs::File>,
@@ -264,28 +277,44 @@ impl RunLog {
 }
 
 pub struct App {
-    pub cfg: Config,
-    pub state: State,
+    cfg: Config,
+    state: State,
     dirs: ProjectDirs,
 }
 
-pub fn config_path(custom: Option<&Path>) -> Result<PathBuf> {
-    Ok(match custom {
-        Some(p) => p.to_path_buf(),
-        None => config::project_dirs()?.config_dir().join("config.toml"),
-    })
+pub fn config_path() -> Result<PathBuf> {
+    Ok(config::project_dirs()?.config_dir().join("config.toml"))
 }
 
 impl App {
-    pub fn open(config: Option<&Path>, state: Option<&Path>) -> Result<App> {
+    /// Exports what `list` reports changed since the cursor stored under `key`,
+    /// and stores the new cursor once a real run finishes without errors.
+    fn export_changes(
+        &self,
+        src: &dyn sources::Source,
+        key: &str,
+        list: impl FnOnce(Option<String>) -> Result<(HashMap<String, photo::Asset>, String)>,
+        progress: Progress,
+        dry: bool,
+    ) -> Result<Summary> {
+        let (assets, next) = list(self.state.get(key)?)?;
+        progress(Event::Changed {
+            total: assets.len(),
+        });
+        let ids: Vec<_> = assets.keys().map(|k| (k.clone(), k.clone())).collect();
+        let s = export::run(src, &self.cfg, &self.state, &assets, &ids, progress, dry);
+        if s.errors == 0 && !dry {
+            self.state.set(key, &next)?;
+        }
+        Ok(s)
+    }
+
+    pub fn open() -> Result<App> {
         let dirs = config::project_dirs()?;
-        let config_path = config_path(config)?;
+        let config_path = config_path()?;
         let cfg = Config::load(&config_path)
             .with_context(|| format!("load config {}", config_path.display()))?;
-        let state = match state {
-            Some(p) => State::open(p)?,
-            None => State::open(&dirs.data_dir().join("state.sqlite"))?,
-        };
+        let state = State::open(&dirs.data_dir().join("state.sqlite"))?;
         Ok(App { cfg, state, dirs })
     }
 
@@ -305,7 +334,7 @@ impl App {
     #[cfg(target_os = "macos")]
     pub fn apple_photos(&self, library: &Path, progress: Progress, dry: bool) -> Result<Summary> {
         let library = config::expand_home(library);
-        let assets = apple_photos::library::load(&library)?;
+        let assets = apple_photos::library::load(&library, progress)?;
         progress(Event::Found {
             total: assets.len(),
             place: library.display().to_string(),
@@ -325,43 +354,25 @@ impl App {
     }
 
     pub fn onedrive(&self, folder: &str, progress: Progress, dry: bool) -> Result<Summary> {
-        let token_path = self.dirs.data_dir().join("onedrive_token.json");
-        let key = format!("onedrive_delta:{folder}");
+        let folder = folder.trim().trim_matches('/');
         let src = sources::onedrive::OneDrive::connect(
             &self.cfg.onedrive_client_id,
-            &token_path,
+            &self.dirs.data_dir().join("onedrive_token.json"),
             progress,
         )?;
-        let (assets, next) = src.list(folder, self.state.get(&key)?)?;
-        progress(Event::Changed {
-            total: assets.len(),
-        });
-        let ids: Vec<_> = assets.keys().map(|k| (k.clone(), k.clone())).collect();
-        let s = export::run(&src, &self.cfg, &self.state, &assets, &ids, progress, dry);
-        if s.errors == 0 && !dry {
-            self.state.set(&key, &next)?;
-        }
-        Ok(s)
+        let key = format!("onedrive_delta:{folder}");
+        self.export_changes(&src, &key, |c| src.list(folder, c), progress, dry)
     }
 
     pub fn dropbox(&self, folder: &str, progress: Progress, dry: bool) -> Result<Summary> {
-        let token_path = self.dirs.data_dir().join("dropbox_token.json");
-        let key = format!("dropbox_cursor:{}", folder.trim().trim_matches('/'));
+        let folder = folder.trim().trim_matches('/');
         let src = sources::dropbox::Dropbox::connect(
-            self.cfg.dropbox_app_key.as_deref().unwrap_or(""),
-            &token_path,
+            &self.cfg.dropbox_app_key,
+            &self.dirs.data_dir().join("dropbox_token.json"),
             progress,
         )?;
-        let (assets, next) = src.list(folder, self.state.get(&key)?)?;
-        progress(Event::Changed {
-            total: assets.len(),
-        });
-        let ids: Vec<_> = assets.keys().map(|k| (k.clone(), k.clone())).collect();
-        let s = export::run(&src, &self.cfg, &self.state, &assets, &ids, progress, dry);
-        if s.errors == 0 && !dry {
-            self.state.set(&key, &next)?;
-        }
-        Ok(s)
+        let key = format!("dropbox_cursor:{folder}");
+        self.export_changes(&src, &key, |c| src.list(folder, c), progress, dry)
     }
 
     pub fn takeout(&self, path: &Path, progress: Progress, dry: bool) -> Result<Summary> {
@@ -372,39 +383,28 @@ impl App {
         consolidate::run(&self.cfg, &self.state, progress, dry)
     }
 
-    /// Previews the templates against the first exported asset, or a built-in sample.
-    pub fn preview_path(&self, path: &str, filename: &str) -> Result<PathPreview> {
-        let exported = self
+    /// The first asset exported under `export_dir` and its stem, to preview
+    /// templates against.
+    pub fn first_exported(&self, export_dir: &Path) -> Result<Option<(photo::Asset, String)>> {
+        let export_dir = config::expand_home(export_dir);
+        Ok(self
             .state
-            .assets_under(&self.cfg.export_dir.to_string_lossy())?
+            .assets_under(&export_dir.to_string_lossy())?
             .into_iter()
             .find_map(|(uuid, dir, stem)| {
                 export::stored_asset(&self.state, &dir, &stem, &uuid)
                     .ok()
                     .flatten()
                     .map(|a| (a, stem))
-            });
-        Ok(match exported {
-            Some((asset, stem)) => preview_path(Some(&self.cfg), path, filename, &asset, &stem),
-            None => preview_path(
-                Some(&self.cfg),
-                path,
-                filename,
-                &photo::Asset::sample(),
-                "sample",
-            ),
-        })
+            }))
     }
 
-    pub fn clean(&self, orphans: bool, dry: bool, progress: Progress) -> Result<clean::Cleaned> {
-        clean::run(&self.cfg, &self.state, orphans, dry, progress)
+    pub fn clean(&self, orphans: bool, progress: Progress, dry: bool) -> Result<clean::Cleaned> {
+        clean::run(&self.cfg, &self.state, orphans, progress, dry)
     }
 
-    pub fn redate_scan(
-        &self,
-        query: Option<&str>,
-        progress: Progress,
-    ) -> Result<Vec<redate::Candidate>> {
+    /// Reports each candidate as an `Event::Flagged`.
+    pub fn redate_scan(&self, query: Option<&str>, progress: Progress) -> Result<()> {
         redate::scan(&self.cfg, &self.state, query, progress)
     }
 

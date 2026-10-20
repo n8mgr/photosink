@@ -1,11 +1,36 @@
-use super::{padded, replace_file, same};
+use super::{padded, same, splice_file};
 use anyhow::{Result, bail};
+use std::borrow::Cow;
+use std::io::Read;
+use std::ops::Range;
 use std::path::Path;
 
 const KEYWORD: &[u8] = b"XML:com.adobe.xmp";
 
+struct Xmp {
+    chunk: Range<usize>,
+    text: Range<usize>,
+    compressed: bool,
+}
+
+impl Xmp {
+    /// The packet, inflated when the chunk is compressed; `None` when it does
+    /// not inflate.
+    fn packet<'a>(&self, data: &'a [u8]) -> Option<Cow<'a, [u8]>> {
+        let text = &data[self.text.clone()];
+        if !self.compressed {
+            return Some(Cow::Borrowed(text));
+        }
+        let mut out = Vec::new();
+        flate2::read::ZlibDecoder::new(text)
+            .read_to_end(&mut out)
+            .ok()?;
+        Some(Cow::Owned(out))
+    }
+}
+
 struct Layout {
-    xmp: Option<(std::ops::Range<usize>, usize)>,
+    xmp: Option<Xmp>,
     insert_at: usize,
 }
 
@@ -35,8 +60,12 @@ fn layout(data: &[u8]) -> Result<Layout> {
                     .unwrap_or(0)
                     + 1;
             }
-            if xmp.is_none() && !compressed && p <= body.len() {
-                xmp = Some((pos..end, pos + 8 + p));
+            if xmp.is_none() && p <= body.len() {
+                xmp = Some(Xmp {
+                    chunk: pos..end,
+                    text: pos + 8 + p..end - 4,
+                    compressed,
+                });
             }
         }
         if kind == b"IEND" {
@@ -73,24 +102,21 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
     let data = std::fs::read(path)?;
     Ok(layout(&data)?
         .xmp
-        .map(|(range, text_at)| data[text_at..range.end - 4].to_vec()))
+        .and_then(|x| x.packet(&data).map(Cow::into_owned)))
 }
 
 pub fn embed(path: &Path, xmp: &str) -> Result<bool> {
-    let mut data = std::fs::read(path)?;
+    let data = std::fs::read(path)?;
     let layout = layout(&data)?;
-    match layout.xmp {
-        Some((range, text_at)) => {
-            if same(&data[text_at..range.end - 4], xmp) {
-                return Ok(false);
-            }
-            data.splice(range, chunk(&padded(xmp)));
-        }
-        None => {
-            data.splice(layout.insert_at..layout.insert_at, chunk(&padded(xmp)));
-        }
+    if let Some(p) = layout.xmp.as_ref().and_then(|x| x.packet(&data))
+        && same(&p, xmp)
+    {
+        return Ok(false);
     }
-    replace_file(path, &data)?;
+    let range = layout
+        .xmp
+        .map_or(layout.insert_at..layout.insert_at, |x| x.chunk);
+    splice_file(path, data, range, chunk(&padded(xmp)))?;
     Ok(true)
 }
 
@@ -129,10 +155,11 @@ mod tests {
         assert!(embed(&p, x1).unwrap());
         let d = std::fs::read(&p).unwrap();
         let l = layout(&d).unwrap();
-        let (range, text_at) = l.xmp.clone().unwrap();
+        let x = l.xmp.unwrap();
+        let range = x.chunk;
         assert_eq!(range.start, 8 + 25, "right after IHDR");
         assert_eq!(l.insert_at, range.end, "IDAT follows");
-        assert!(d[text_at..].starts_with(b"<x>1</x>"));
+        assert!(d[x.text.start..].starts_with(b"<x>1</x>"));
         let body = &d[range.start + 8..range.end - 4];
         let mut h = crc32fast::Hasher::new();
         h.update(b"iTXt");
@@ -145,5 +172,34 @@ mod tests {
         assert_eq!(d2.len(), d.len());
         assert_eq!(super::super::find(&d2, b"<x>1</x>"), None);
         assert!(d2.ends_with(&raw_chunk(b"IEND", &[])));
+    }
+
+    #[test]
+    fn replaces_compressed_packet() {
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write;
+        let old = "<x>old</x>\n<?xpacket end=\"w\"?>\n";
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+        z.write_all(old.as_bytes()).unwrap();
+        let mut body = KEYWORD.to_vec();
+        body.extend_from_slice(&[0, 1, 0, 0, 0]);
+        body.extend(z.finish().unwrap());
+        let mut d = png();
+        let idat = super::super::find(&d, b"IDAT").unwrap() - 4;
+        d.splice(idat..idat, raw_chunk(b"iTXt", &body));
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.png");
+        std::fs::write(&p, &d).unwrap();
+        assert!(same(&read(&p).unwrap().unwrap(), old));
+        assert!(!embed(&p, old).unwrap());
+        let x = "<x>new</x>\n<?xpacket end=\"w\"?>\n";
+        assert!(embed(&p, x).unwrap());
+        let d2 = std::fs::read(&p).unwrap();
+        assert_eq!(
+            d2.windows(4).filter(|w| w == b"iTXt").count(),
+            1,
+            "one XMP chunk"
+        );
+        assert!(same(&read(&p).unwrap().unwrap(), x));
     }
 }

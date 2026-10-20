@@ -1,34 +1,27 @@
+use crate::sources::Kind;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 pub struct State {
     conn: Mutex<Connection>,
 }
 
 #[derive(Debug, Clone)]
-pub struct Export {
-    pub uuid: String,
-    pub kind: String,
-    pub hash: String,
-    pub path: String,
+pub(crate) struct Export {
+    pub(crate) uuid: String,
+    pub(crate) kind: Kind,
+    pub(crate) path: String,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Placed {
+pub(crate) enum Placed {
     New(String),
     Duplicate(String),
 }
 
 impl State {
-    pub fn open(path: &Path) -> Result<State> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        State::from_conn(Connection::open(path)?)
-    }
-
     fn from_conn(conn: Connection) -> Result<State> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS assets (uuid TEXT PRIMARY KEY, dir TEXT NOT NULL, stem TEXT NOT NULL, UNIQUE (dir, stem));
@@ -41,54 +34,54 @@ impl State {
         })
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<String>> {
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
+    }
+
+    pub(crate) fn open(path: &Path) -> Result<State> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        State::from_conn(Connection::open(path)?)
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Result<Option<String>> {
         Ok(self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .query_row("SELECT value FROM kv WHERE key = ?", [key], |r| r.get(0))
             .optional()?)
     }
 
-    pub fn set(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .lock()
-            .unwrap()
+    pub(crate) fn set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn()
             .execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", [key, value])?;
         Ok(())
     }
 
-    pub fn stem(&self, uuid: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT stem FROM assets WHERE uuid = ?", [uuid], |r| {
-                r.get(0)
-            })
-            .optional()?)
+    #[cfg(test)]
+    pub(crate) fn stem(&self, uuid: &str) -> Result<Option<String>> {
+        Ok(self.location(uuid)?.map(|(_, stem)| stem))
     }
 
-    pub fn location(&self, uuid: &str) -> Result<Option<(String, String)>> {
+    /// The folder and stem the asset is placed under.
+    pub(crate) fn location(&self, uuid: &str) -> Result<Option<(String, String)>> {
         Ok(self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .query_row("SELECT dir, stem FROM assets WHERE uuid = ?", [uuid], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .optional()?)
     }
 
-    pub fn claim_stem(&self, uuid: &str, dir: &str, stem: &str) -> Result<bool> {
-        Ok(self.conn.lock().unwrap().execute(
+    pub(crate) fn claim_stem(&self, uuid: &str, dir: &str, stem: &str) -> Result<bool> {
+        Ok(self.conn().execute(
             "INSERT OR IGNORE INTO assets VALUES (?, ?, ?)",
             [uuid, dir, stem],
         )? == 1)
     }
 
-    pub fn assets_under(&self, dir: &str) -> Result<Vec<(String, String, String)>> {
-        let conn = self.conn.lock().unwrap();
+    pub(crate) fn assets_under(&self, dir: &str) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT uuid, dir, stem FROM assets WHERE dir = ?1 OR dir LIKE ?2 ESCAPE '\\' ORDER BY dir, stem",
         )?;
@@ -102,11 +95,9 @@ impl State {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn stem_owner(&self, dir: &str, stem: &str) -> Result<Option<String>> {
+    pub(crate) fn stem_owner(&self, dir: &str, stem: &str) -> Result<Option<String>> {
         Ok(self
-            .conn
-            .lock()
-            .unwrap()
+            .conn()
             .query_row(
                 "SELECT uuid FROM assets WHERE dir = ? AND stem = ?",
                 [dir, stem],
@@ -115,37 +106,31 @@ impl State {
             .optional()?)
     }
 
-    pub fn exports_of(&self, uuid: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().unwrap();
+    pub(crate) fn exports_of(&self, uuid: &str) -> Result<Vec<(Kind, String)>> {
+        let conn = self.conn();
         let mut stmt = conn.prepare("SELECT kind, path FROM exports WHERE uuid = ?")?;
         let rows = stmt.query_map([uuid], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn relocate(
+    pub(crate) fn relocate(
         &self,
         uuid: &str,
         dir: &str,
         stem: &str,
-        paths: &[(String, String)],
+        paths: &[(Kind, String)],
     ) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE assets SET dir = ?, stem = ? WHERE uuid = ?",
             [dir, stem, uuid],
         )?;
         for (kind, path) in paths {
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT path FROM exports WHERE uuid = ? AND kind = ?",
-                    [uuid, kind],
-                    |r| r.get(0),
-                )
-                .optional()?;
+            let old = exported(&tx, uuid, *kind)?;
             tx.execute(
                 "UPDATE exports SET path = ? WHERE uuid = ? AND kind = ?",
-                [path, uuid, kind],
+                params![path, uuid, kind],
             )?;
             // Content duplicates of this asset point at the same file.
             if let Some(old) = old {
@@ -156,8 +141,8 @@ impl State {
         Ok(())
     }
 
-    pub fn shared(&self, path: &str) -> Result<bool> {
-        let n: i64 = self.conn.lock().unwrap().query_row(
+    pub(crate) fn shared(&self, path: &str) -> Result<bool> {
+        let n: i64 = self.conn().query_row(
             "SELECT COUNT(DISTINCT uuid) FROM exports WHERE path = ?",
             [path],
             |r| r.get(0),
@@ -165,88 +150,59 @@ impl State {
         Ok(n > 1)
     }
 
-    pub fn all_exports(&self) -> Result<Vec<Export>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT uuid, kind, hash, path FROM exports ORDER BY rowid")?;
+    pub(crate) fn all_exports(&self) -> Result<Vec<Export>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT uuid, kind, path FROM exports ORDER BY rowid")?;
         let rows = stmt.query_map([], |r| {
             Ok(Export {
                 uuid: r.get(0)?,
                 kind: r.get(1)?,
-                hash: r.get(2)?,
-                path: r.get(3)?,
+                path: r.get(2)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn forget_export(&self, uuid: &str, kind: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
+    pub(crate) fn forget_export(&self, uuid: &str, kind: Kind) -> Result<()> {
+        self.conn().execute(
             "DELETE FROM exports WHERE uuid = ? AND kind = ?",
-            [uuid, kind],
+            params![uuid, kind],
         )?;
         Ok(())
     }
 
     /// Drops the asset's folder claim and remaining rows; a later run places
     /// it afresh. The `taken:<uuid>` override, if any, is kept.
-    pub fn forget_asset(&self, uuid: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+    pub(crate) fn forget_asset(&self, uuid: &str) -> Result<()> {
+        let conn = self.conn();
         conn.execute("DELETE FROM exports WHERE uuid = ?", [uuid])?;
         conn.execute("DELETE FROM assets WHERE uuid = ?", [uuid])?;
         Ok(())
     }
 
-    pub fn exported(&self, uuid: &str, kind: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT path FROM exports WHERE uuid = ? AND kind = ?",
-                [uuid, kind],
-                |r| r.get(0),
-            )
-            .optional()?)
+    pub(crate) fn exported(&self, uuid: &str, kind: Kind) -> Result<Option<String>> {
+        exported(&self.conn(), uuid, kind)
     }
 
-    pub fn record(&self, uuid: &str, kind: &str, hash: &str, path: &str) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "INSERT OR REPLACE INTO exports VALUES (?, ?, ?, ?)",
-            params![uuid, kind, hash, path],
-        )?;
-        Ok(())
+    #[cfg(test)]
+    pub(crate) fn record(&self, uuid: &str, kind: Kind, hash: &str, path: &str) -> Result<()> {
+        record(&self.conn(), uuid, kind, hash, path)
     }
 
-    pub fn duplicate(&self, hash: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT path FROM exports WHERE hash = ? LIMIT 1",
-                [hash],
-                |r| r.get(0),
-            )
-            .optional()?)
+    pub(crate) fn duplicate(&self, hash: &str) -> Result<Option<String>> {
+        duplicate(&self.conn(), hash)
     }
 
-    pub fn place(
+    pub(crate) fn place(
         &self,
         uuid: &str,
-        kind: &str,
+        kind: Kind,
         hash: &str,
         tmp: &Path,
         dest: impl FnOnce() -> Result<Placed>,
     ) -> Result<Placed> {
-        let conn = self.conn.lock().unwrap();
-        let existing: Option<String> = conn
-            .query_row(
-                "SELECT path FROM exports WHERE hash = ? LIMIT 1",
-                [hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let placed = match existing {
+        let conn = self.conn();
+        let placed = match duplicate(&conn, hash)? {
             Some(path) => {
                 std::fs::remove_file(tmp)?;
                 Placed::Duplicate(path)
@@ -254,12 +210,37 @@ impl State {
             None => dest()?,
         };
         let (Placed::New(path) | Placed::Duplicate(path)) = &placed;
-        conn.execute(
-            "INSERT OR REPLACE INTO exports VALUES (?, ?, ?, ?)",
-            params![uuid, kind, hash, path],
-        )?;
+        record(&conn, uuid, kind, hash, path)?;
         Ok(placed)
     }
+}
+
+fn exported(conn: &Connection, uuid: &str, kind: Kind) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT path FROM exports WHERE uuid = ? AND kind = ?",
+            params![uuid, kind],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn record(conn: &Connection, uuid: &str, kind: Kind, hash: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO exports VALUES (?, ?, ?, ?)",
+        params![uuid, kind, hash, path],
+    )?;
+    Ok(())
+}
+
+fn duplicate(conn: &Connection, hash: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT path FROM exports WHERE hash = ? LIMIT 1",
+            [hash],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 #[cfg(test)]
@@ -285,28 +266,29 @@ mod tests {
             std::fs::rename(&tmp, to)?;
             Ok(Placed::New(to.to_string_lossy().into_owned()))
         };
-        assert_eq!(s.exported("u", "original").unwrap(), None);
+        assert_eq!(s.exported("u", Kind::Original).unwrap(), None);
         assert_eq!(s.duplicate("h").unwrap(), None);
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("u", "original", "h", &tmp, || mv(&dest)).unwrap(),
+            s.place("u", Kind::Original, "h", &tmp, || mv(&dest))
+                .unwrap(),
             Placed::New(dest.to_string_lossy().into_owned())
         );
         assert!(dest.exists() && !tmp.exists());
         assert_eq!(
-            s.exported("u", "original").unwrap().as_deref(),
+            s.exported("u", Kind::Original).unwrap().as_deref(),
             Some(dest.to_str().unwrap())
         );
-        assert_eq!(s.exported("u", "edited").unwrap(), None);
+        assert_eq!(s.exported("u", Kind::Edited).unwrap(), None);
         assert_eq!(s.duplicate("h").unwrap().as_deref(), dest.to_str());
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("v", "original", "h", &tmp, || unreachable!())
+            s.place("v", Kind::Original, "h", &tmp, || unreachable!())
                 .unwrap(),
             Placed::Duplicate(dest.to_string_lossy().into_owned())
         );
         assert!(!tmp.exists());
-        assert!(s.exported("v", "original").unwrap().is_some());
+        assert!(s.exported("v", Kind::Original).unwrap().is_some());
     }
 
     #[test]
@@ -315,8 +297,9 @@ mod tests {
         s.claim_stem("u", "/e/a", "IMG_1").unwrap();
         s.claim_stem("v", "/e/a/sub", "IMG_2").unwrap();
         s.claim_stem("w", "/e/ab", "IMG_3").unwrap();
-        s.record("u", "original", "h1", "/e/a/IMG_1.jpg").unwrap();
-        s.record("u", "edited", "h2", "/e/a/IMG_1_edited.jpg")
+        s.record("u", Kind::Original, "h1", "/e/a/IMG_1.jpg")
+            .unwrap();
+        s.record("u", Kind::Edited, "h2", "/e/a/IMG_1_edited.jpg")
             .unwrap();
         let under = s.assets_under("/e/a").unwrap();
         assert_eq!(under.len(), 2);
@@ -327,7 +310,7 @@ mod tests {
             "u",
             "/e/b",
             "IMG_1_x",
-            &[("original".into(), "/e/b/IMG_1_x.jpg".into())],
+            &[(Kind::Original, "/e/b/IMG_1_x.jpg".into())],
         )
         .unwrap();
         assert_eq!(s.stem("u").unwrap().as_deref(), Some("IMG_1_x"));
@@ -336,8 +319,8 @@ mod tests {
         assert_eq!(
             ex,
             [
-                ("edited".to_string(), "/e/a/IMG_1_edited.jpg".to_string()),
-                ("original".to_string(), "/e/b/IMG_1_x.jpg".to_string())
+                (Kind::Original, "/e/b/IMG_1_x.jpg".to_string()),
+                (Kind::Edited, "/e/a/IMG_1_edited.jpg".to_string())
             ]
         );
         assert!(s.assets_under("/e/a").unwrap().iter().all(|a| a.0 == "v"));

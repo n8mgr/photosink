@@ -26,17 +26,18 @@ public sealed partial class TemplatePreview : StackPanel
 
     internal void Show(Preview preview, TemplateKind kind)
     {
-        var bad = preview.Problem is not null;
-        problem.Text = preview.Problem ?? "";
+        var check = kind == TemplateKind.Folder ? preview.Folder : preview.Filename;
+        var bad = check.Unknown.Length > 0;
+        problem.Text = bad ? Copy.UnknownFields(check.Unknown) : "";
         problem.Visibility = bad ? Visibility.Visible : Visibility.Collapsed;
         path.Visibility = note.Visibility = bad ? Visibility.Collapsed : Visibility.Visible;
         path.Inlines.Clear();
-        path.Inlines.Add(new Run { Text = "→ " + preview.Root + "/" });
-        path.Inlines.Add(Part(preview.Dir, kind == TemplateKind.Folder));
+        path.Inlines.Add(new Run { Text = "→ " + (preview.Root ?? "Export") + "/" });
+        path.Inlines.Add(Part(preview.Dir.Length == 0 ? "…" : preview.Dir, kind == TemplateKind.Folder));
         path.Inlines.Add(new Run { Text = "/" });
         path.Inlines.Add(Part(preview.File, kind == TemplateKind.Filename));
         path.Inlines.Add(new Run { Text = "." + preview.Ext });
-        note.Text = preview.SampleNote;
+        note.Text = Copy.PreviewNote(preview);
     }
 
     private static Run Part(string text, bool edited) => new()

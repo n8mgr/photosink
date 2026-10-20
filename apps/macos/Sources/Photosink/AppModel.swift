@@ -48,15 +48,15 @@ final class AppModel {
     @ObservationIgnored private let relay: Relay
     @ObservationIgnored private var rows: [Tab: Pages<Row>] = [:]
     @ObservationIgnored private(set) var dateRows: Pages<DateRow>!
-    @ObservationIgnored private var lastInGroup: [String: Tab] = [:]
+    @ObservationIgnored private var lastInGroup: [SidebarGroup: Tab] = [:]
 
-    let groups: [Group]
-    let options: Options
-    let fields: [FieldGroup]
+    let available: [Tab]
+    let fields: [Field]
     var settings: Settings?
-    var summaries: Summaries?
     var settingsError: String?
     var status: Status
+    var runningTab: Tab?
+    var notice: String?
     var tab: Tab
     var args: RunArgs
     var tabs: [Tab: TabState] = [:]
@@ -71,63 +71,55 @@ final class AppModel {
         let core = Core(listener: relay)
         self.relay = relay
         self.core = core
-        groups = core.groups()
-        options = core.options()
+        available = core.tabs()
         fields = core.fields()
         status = core.status()
+        runningTab = core.running()
         dates = core.datesView()
-        let first = groups.first?.tabs.first?.tab ?? .consolidate
+        let first = available.first ?? .consolidate
         tab = first
         args = core.runArgs(tab: first)
         relay.model = self
         dateRows = Pages { [core] start, count in core.datesRows(start: start, count: count) }
-        for g in groups {
-            lastInGroup[g.name] = g.tabs.first?.tab
-            for t in g.tabs {
-                rows[t.tab] = Pages { [core] start, count in core.gridRows(tab: t.tab, start: start, count: count) }
-                tabs[t.tab] = TabState()
-            }
+        for t in available {
+            rows[t] = Pages { [core] start, count in core.gridRows(tab: t, start: start, count: count) }
+            tabs[t] = TabState()
         }
         do {
-            let s = try core.settings()
-            settings = s
-            summaries = core.summaries(settings: s)
+            settings = try core.settings()
         } catch {
-            settingsError = message(error)
+            settingsError = message(error, tab: first)
         }
     }
 
-    var info: TabInfo? {
-        groups.flatMap(\.tabs).first { $0.tab == tab }
-    }
+    var running: Bool { runningTab != nil }
 
-    var group: Group? {
-        groups.first { $0.tabs.contains { $0.tab == tab } }
-    }
-
-    var running: Bool { status.running != nil }
-
-    var blocker: String? {
+    var blocker: Blocker? {
         _ = status
+        _ = runningTab
         _ = settings
         _ = args
         return core.blocker(tab: tab)
     }
 
-    var runLabel: String {
-        _ = args
-        return core.runLabel(tab: tab)
+    var blockerText: String? {
+        blocker?.text(for: tab)
     }
 
-    func message(_ error: Error) -> String {
-        if case let CoreError.Failed(m) = error { return m }
-        return error.localizedDescription
+    var runLabel: String {
+        tab.runLabel(args)
+    }
+
+    func tabs(in group: SidebarGroup) -> [Tab] {
+        available.filter(group.contains)
     }
 
     func apply(_ change: Change) {
         switch change {
         case .status:
             status = core.status()
+            runningTab = core.running()
+            notice = nil
         case let .grid(t):
             refresh(t)
         case .dates:
@@ -157,11 +149,11 @@ final class AppModel {
         guard !running || t == tab else { return }
         tab = t
         args = core.runArgs(tab: t)
-        if let g = group { lastInGroup[g.name] = t }
+        if let g = SidebarGroup.allCases.first(where: { $0.contains(t) }) { lastInGroup[g] = t }
     }
 
-    func selectGroup(_ name: String) {
-        guard let t = lastInGroup[name] ?? groups.first(where: { $0.name == name })?.tabs.first?.tab else { return }
+    func selectGroup(_ group: SidebarGroup) {
+        guard let t = lastInGroup[group] ?? tabs(in: group).first else { return }
         select(t)
     }
 
@@ -172,12 +164,11 @@ final class AppModel {
 
     func save(_ s: Settings) {
         settings = s
-        summaries = core.summaries(settings: s)
         do {
             try core.saveSettings(settings: s)
             settingsError = nil
         } catch {
-            settingsError = message(error)
+            settingsError = message(error, tab: tab)
         }
     }
 
@@ -194,7 +185,7 @@ final class AppModel {
         do {
             try core.start(tab: tab)
         } catch {
-            status = Status(text: message(error), error: true, running: nil)
+            notice = message(error, tab: tab)
         }
     }
 
@@ -202,15 +193,18 @@ final class AppModel {
         do {
             try core.applyDates()
         } catch {
-            status = Status(text: message(error), error: true, running: nil)
+            notice = message(error, tab: .dates)
         }
     }
 
     func open(_ path: String) {
-        do {
-            try core.openPath(path: path)
-        } catch {
-            status = Status(text: message(error), error: true, running: status.running)
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+            notice = "\(path): \(String(cString: strerror(ENOENT)))"
+            return
+        }
+        if !NSWorkspace.shared.open(url) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
         }
     }
 }

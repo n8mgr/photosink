@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use gtk::gio;
 
 /// Shows errors from Core as toasts.
 #[derive(Clone)]
@@ -50,26 +51,6 @@ pub fn set_class(widget: &impl IsA<gtk::Widget>, class: &str, on: bool) {
     }
 }
 
-pub fn utf16_offset(text: &str, chars: i32) -> u32 {
-    text.chars()
-        .take(chars.max(0) as usize)
-        .map(char::len_utf16)
-        .sum::<usize>() as u32
-}
-
-pub fn char_offset(text: &str, utf16: u32) -> i32 {
-    let mut units = 0u32;
-    let mut n = 0i32;
-    for c in text.chars() {
-        if units >= utf16 {
-            break;
-        }
-        units += c.len_utf16() as u32;
-        n += 1;
-    }
-    n
-}
-
 pub fn window_of(widget: &impl IsA<gtk::Widget>) -> Option<gtk::Window> {
     widget.root().and_downcast::<gtk::Window>()
 }
@@ -86,4 +67,21 @@ pub fn on_focus_out(widget: &impl IsA<gtk::Widget>, f: impl Fn() + 'static) {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_leave(move |_| f());
     widget.add_controller(focus);
+}
+
+/// Opens `path` with its default app, or its containing folder, toasting failures.
+pub fn launch(widget: &impl IsA<gtk::Widget>, toaster: &Toaster, path: &str, folder: bool) {
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+    let parent = window_of(widget);
+    let (toaster, path) = (toaster.clone(), path.to_owned());
+    let done = move |res: Result<(), gtk::glib::Error>| {
+        if let Err(e) = res {
+            toaster.show(format!("{path}: {}", e.message()));
+        }
+    };
+    if folder {
+        launcher.open_containing_folder(parent.as_ref(), gio::Cancellable::NONE, done);
+    } else {
+        launcher.launch(parent.as_ref(), gio::Cancellable::NONE, done);
+    }
 }

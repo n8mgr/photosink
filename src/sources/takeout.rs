@@ -1,4 +1,4 @@
-use super::Kind;
+use super::{Kind, extension, is_media};
 use crate::config::Config;
 use crate::export::{Exporter, Summary, write_hashed};
 use crate::photo::Asset;
@@ -7,7 +7,7 @@ use crate::{Event, Progress};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -17,16 +17,64 @@ struct Index {
     pending: HashMap<String, usize>,
 }
 
-fn ext(name: &str) -> String {
-    Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+struct Import<'a> {
+    cfg: &'a Config,
+    idx: Index,
+    ex: Exporter<'a>,
+    seen: HashMap<String, usize>,
+    filtered: HashSet<String>,
 }
 
-fn is_media(name: &str) -> bool {
-    super::is_media(name)
+impl Import<'_> {
+    /// Exports one indexed file, or plans it when `data` is None. The asset is
+    /// reported and its sidecar written after its last file.
+    fn entry(&mut self, rel: &Path, data: Option<&mut dyn Read>) {
+        let Some((uuid, kind)) = self.idx.entries.get(rel) else {
+            return;
+        };
+        let Some(asset) = self.idx.assets.get(uuid) else {
+            return;
+        };
+        if !self.cfg.filter.matches(asset) {
+            if self.filtered.insert(uuid.clone()) {
+                self.ex.summary.filtered += 1;
+            }
+            return;
+        }
+        let total = self.idx.assets.len();
+        let next = self.seen.len() + 1;
+        let n = *self.seen.entry(uuid.clone()).or_insert(next);
+        self.ex.set_pos(n, total);
+        let ex = &mut self.ex;
+        let pending = &mut self.idx.pending;
+        let step = || -> Result<()> {
+            if kind.wanted(self.cfg) {
+                if ex.exported(uuid, *kind)? {
+                    ex.summary.skipped += 1;
+                } else if let Some(r) = data {
+                    let tmp = ex.temp_path(uuid, *kind)?;
+                    let hash = write_hashed(r, &tmp)?;
+                    ex.place(asset, *kind, &name_of(rel), &tmp, &hash)?;
+                } else {
+                    ex.plan(asset, *kind, &name_of(rel))?;
+                }
+            }
+            let left = pending.get_mut(uuid).unwrap();
+            *left -= 1;
+            if *left == 0 {
+                ex.emit(Event::Asset {
+                    n,
+                    total,
+                    name: asset.filename.clone(),
+                });
+                ex.sidecar(asset)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = step() {
+            ex.fail(&asset.filename, format!("{e:#}"));
+        }
+    }
 }
 
 fn is_archive(path: &Path) -> bool {
@@ -178,7 +226,7 @@ fn index(sources: &[PathBuf], progress: Progress) -> Result<Index> {
         });
         walk(s, |rel, r| {
             let name = name_of(&rel);
-            if ext(&name) == "json" {
+            if extension(&name) == "json" {
                 let mut buf = Vec::new();
                 r.read_to_end(&mut buf)?;
                 jsons.insert(rel, buf);
@@ -238,7 +286,7 @@ fn index(sources: &[PathBuf], progress: Progress) -> Result<Index> {
     Ok(idx)
 }
 
-pub fn import(
+pub(crate) fn import(
     path: &Path,
     cfg: &Config,
     state: &State,
@@ -256,108 +304,36 @@ pub fn import(
     } else {
         vec![path.to_path_buf()]
     };
-    let mut idx = index(&sources, progress)?;
-    let total = idx.assets.len();
+    let idx = index(&sources, progress)?;
     progress(Event::Found {
-        total,
+        total: idx.assets.len(),
         place: path.display().to_string(),
     });
-    let mut ex = Exporter::new(cfg, state, progress, dry);
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    let mut filtered = std::collections::HashSet::new();
+    let mut import = Import {
+        cfg,
+        idx,
+        ex: Exporter::new(cfg, state, progress, dry),
+        seen: HashMap::new(),
+        filtered: HashSet::new(),
+    };
     if dry {
-        let mut entries: Vec<_> = idx.entries.iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(b.0));
-        for (rel, (uuid, kind)) in entries {
-            let Some(asset) = idx.assets.get(uuid).filter(|_| kind.wanted(cfg)) else {
-                continue;
-            };
-            if !cfg.filter.matches(asset) {
-                if filtered.insert(uuid.clone()) {
-                    ex.summary.filtered += 1;
-                }
-                continue;
-            }
-            let next = seen.len() + 1;
-            let n = *seen.entry(uuid.clone()).or_insert_with(|| {
-                ex.emit(Event::Asset {
-                    n: next,
-                    total,
-                    name: asset.filename.clone(),
-                });
-                next
-            });
-            ex.set_pos(n, total);
-            if ex.exported(uuid, *kind)? {
-                ex.summary.skipped += 1;
-            } else if let Err(e) = ex.plan(asset, *kind, &name_of(rel)) {
-                ex.emit(Event::Error {
-                    n: Some(n),
-                    total: Some(total),
-                    subject: asset.filename.clone(),
-                    text: format!("{e:#}"),
-                });
-                ex.summary.errors += 1;
-            }
+        let mut rels: Vec<PathBuf> = import.idx.entries.keys().cloned().collect();
+        rels.sort();
+        for rel in rels {
+            import.entry(&rel, None);
         }
-        return Ok(ex.finish());
-    }
-    for s in &sources {
-        progress(Event::Reading {
-            path: s.display().to_string(),
-        });
-        walk(s, |rel, r| {
-            let Some((uuid, kind)) = idx.entries.get(&rel) else {
-                return Ok(());
-            };
-            if !kind.wanted(cfg) {
-                return Ok(());
-            }
-            let Some(asset) = idx.assets.get(uuid) else {
-                return Ok(());
-            };
-            if !cfg.filter.matches(asset) {
-                if filtered.insert(uuid.clone()) {
-                    ex.summary.filtered += 1;
-                }
-                return Ok(());
-            }
-            let next = seen.len() + 1;
-            let n = *seen.entry(uuid.clone()).or_insert(next);
-            ex.set_pos(n, total);
-            let step = || -> Result<()> {
-                if ex.exported(uuid, *kind)? {
-                    ex.summary.skipped += 1;
-                } else {
-                    let tmp = ex.temp_path(uuid, *kind)?;
-                    let hash = write_hashed(r, &tmp)?;
-                    ex.place(asset, *kind, &name_of(&rel), &tmp, &hash)?;
-                }
-                let left = idx.pending.get_mut(uuid).unwrap();
-                *left -= 1;
-                if *left == 0 {
-                    ex.emit(Event::Asset {
-                        n,
-                        total,
-                        name: asset.filename.clone(),
-                    });
-                    ex.sidecar(asset)?;
-                }
+    } else {
+        for s in &sources {
+            progress(Event::Reading {
+                path: s.display().to_string(),
+            });
+            walk(s, |rel, r| {
+                import.entry(&rel, Some(r));
                 Ok(())
-            };
-            if let Err(e) = step() {
-                ex.emit(Event::Error {
-                    n: Some(n),
-                    total: Some(total),
-                    subject: asset.filename.clone(),
-                    text: format!("{e:#}"),
-                });
-                ex.summary.errors += 1;
-            }
-            Ok(())
-        })?;
+            })?;
+        }
     }
-    Ok(ex.finish())
+    Ok(import.ex.finish())
 }
 
 #[cfg(test)]
@@ -526,5 +502,22 @@ mod tests {
         assert!(!out.join(".tmp").exists());
         let s = import(dir.path(), &cfg, &state, &|e| eprintln!("{e}"), false).unwrap();
         assert_eq!((s.skipped, s.exported), (5, 0));
+    }
+
+    #[test]
+    fn writes_sidecars_when_edits_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path());
+        let out = dir.path().join("out");
+        let cfg = Config::parse(&format!(
+            "export_dir = \"{}\"\npath = \"{{take.year}}\"",
+            out.display()
+        ))
+        .unwrap();
+        let state = State::open(&dir.path().join("state.sqlite")).unwrap();
+        let s = import(dir.path(), &cfg, &state, &|e| eprintln!("{e}"), false).unwrap();
+        assert_eq!((s.exported, s.errors), (2, 0));
+        assert!(out.join("2019/IMG_1.xmp").exists());
+        assert!(!out.join("2019/IMG_1_edited.jpg").exists());
     }
 }

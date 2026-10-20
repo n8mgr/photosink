@@ -1,11 +1,12 @@
+use crate::copy;
 use crate::lazy_list::LazyList;
 use crate::status_view::StatusView;
 use crate::ui::{self, Toaster, hbox, label, vbox};
 use gtk::glib;
 use gtk::prelude::*;
 use photosink_bridge::Core;
-use photosink_bridge::dates::{DateKey, DateRow, DatesView};
-use std::cell::RefCell;
+use photosink_bridge::catalog::Tab;
+use photosink_bridge::dates::{DateRow, DatesView};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,52 +20,29 @@ pub struct DatesPanel {
     summary: gtk::Label,
     progress: gtk::ProgressBar,
     choose: gtk::MenuButton,
-    choose_box: gtk::Box,
-    choose_keys: RefCell<Option<Vec<DateKey>>>,
     apply: gtk::Button,
     content: gtk::Stack,
     empty: adw::StatusPage,
     model: LazyList,
-    placeholder: Rc<RefCell<String>>,
+}
+
+fn choice_button(
+    core: &Arc<Core>,
+    popover: &gtk::Popover,
+    text: &str,
+    f: impl Fn(&Core) + 'static,
+) -> gtk::Button {
+    let b = gtk::Button::with_label(text);
+    b.add_css_class("flat");
+    let (core, popover) = (core.clone(), popover.clone());
+    b.connect_clicked(move |_| {
+        f(&core);
+        popover.popdown();
+    });
+    b
 }
 
 impl DatesPanel {
-    fn choice_button(&self, text: &str, f: impl Fn(&Core) + 'static) -> gtk::Button {
-        let b = gtk::Button::with_label(text);
-        b.add_css_class("flat");
-        let (core, popover) = (self.core.clone(), self.choose.popover());
-        b.connect_clicked(move |_| {
-            f(&core);
-            if let Some(p) = &popover {
-                p.popdown();
-            }
-        });
-        b
-    }
-
-    fn refresh_choose(&self, can_pick: bool) {
-        let first = self.core.dates_rows(0, 1);
-        let options: Vec<(DateKey, String)> = first
-            .first()
-            .map(|r| r.options.iter().map(|o| (o.key, o.label.clone())).collect())
-            .unwrap_or_default();
-        let keys: Vec<DateKey> = options.iter().map(|(k, _)| *k).collect();
-        if self.choose_keys.borrow().as_ref() != Some(&keys) {
-            ui::clear(&self.choose_box);
-            for (key, text) in options {
-                self.choose_box
-                    .append(&self.choice_button(&text, move |core| core.dates_pick_all(key)));
-            }
-            self.choose_box
-                .append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-            self.choose_box
-                .append(&self.choice_button("None", |core| core.dates_clear()));
-            self.choose_keys.replace(Some(keys));
-        }
-        self.choose
-            .set_sensitive(can_pick && self.core.dates_len() > 0);
-    }
-
     pub fn new(
         core: Arc<Core>,
         status: &Rc<StatusView>,
@@ -92,10 +70,8 @@ impl DatesPanel {
             item.set_child(Some(&cell));
             item.set_activatable(false);
         });
-        let placeholder = Rc::new(RefCell::new(String::new()));
         factory.connect_bind({
             let core = core.clone();
-            let placeholder = placeholder.clone();
             move |_, item| {
                 let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
                 let Some(cell) = item.child().and_downcast::<gtk::Box>() else {
@@ -107,7 +83,7 @@ impl DatesPanel {
                 };
                 let row = obj.borrow::<Option<DateRow>>();
                 if let Some(row) = row.as_ref() {
-                    cell.append(&date_row(row, &core, &placeholder.borrow()));
+                    cell.append(&date_row(row, &core));
                 }
             }
         });
@@ -151,9 +127,21 @@ impl DatesPanel {
 
         let choose_box = vbox(0);
         let popover = gtk::Popover::new();
+        for key in copy::DATE_KEYS {
+            choose_box.append(&choice_button(
+                &core,
+                &popover,
+                copy::date_key(key),
+                move |core| core.dates_pick_all(key),
+            ));
+        }
+        choose_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        choose_box.append(&choice_button(&core, &popover, "None", |core| {
+            core.dates_clear()
+        }));
         popover.set_child(Some(&choose_box));
         let choose = gtk::MenuButton::builder()
-            .label("Choose all")
+            .label("Choose All")
             .popover(&popover)
             .build();
         let apply = gtk::Button::new();
@@ -174,18 +162,15 @@ impl DatesPanel {
             summary,
             progress,
             choose,
-            choose_box,
-            choose_keys: RefCell::new(None),
             apply,
             content,
             empty,
             model,
-            placeholder,
         });
         let core = panel.core.clone();
         panel.apply.connect_clicked(move |_| {
             if let Err(e) = core.apply_dates() {
-                toaster.show(e.to_string());
+                toaster.show(copy::error(Tab::Dates, &e));
             }
         });
         panel
@@ -193,19 +178,27 @@ impl DatesPanel {
 
     pub fn refresh(&self) {
         let view: DatesView = self.core.dates_view();
-        self.placeholder.replace(view.manual_placeholder.clone());
         let page = if view.shown { "picker" } else { "status" };
         self.root.set_visible_child_name(page);
         self.header
             .set_visible_child_name(if view.shown { "picker" } else { "normal" });
         self.model.refresh();
-        self.summary.set_text(&view.summary);
+        self.summary.set_text(&copy::dates_summary(
+            view.scanning,
+            view.scan.map(|p| (p.checked, p.total)),
+            view.rows,
+            view.query,
+            view.chosen,
+        ));
         self.progress.set_visible(view.scanning);
         self.progress.set_fraction(view.progress);
-        self.refresh_choose(view.can_pick);
-        self.apply.set_label(&view.apply_label);
+        self.choose
+            .set_sensitive(view.can_pick && self.core.dates_len() > 0);
+        self.apply
+            .set_label(&copy::dates_apply(view.applying, view.chosen));
         self.apply.set_sensitive(view.can_apply);
-        self.empty.set_title(&view.empty_text);
+        self.empty
+            .set_title(copy::dates_empty(view.scanning, view.query));
         self.content
             .set_visible_child_name(if self.core.dates_len() == 0 {
                 "empty"
@@ -216,7 +209,92 @@ impl DatesPanel {
     }
 }
 
-fn date_row(row: &DateRow, core: &Arc<Core>, placeholder: &str) -> gtk::Widget {
+fn spin(max: f64, value: i32) -> gtk::SpinButton {
+    let s = gtk::SpinButton::with_range(0.0, max, 1.0);
+    s.set_value(value as f64);
+    s.set_wrap(true);
+    s.set_numeric(true);
+    s.set_orientation(gtk::Orientation::Vertical);
+    s.connect_output(|s| {
+        s.set_text(&format!("{:02}", s.value_as_int()));
+        glib::Propagation::Stop
+    });
+    s
+}
+
+fn manual_picker(row: &DateRow, core: &Arc<Core>) -> gtk::MenuButton {
+    let initial = row
+        .manual
+        .or(row.current)
+        .and_then(|at| glib::DateTime::from_unix_utc(at).ok());
+    let calendar = gtk::Calendar::new();
+    if let Some(d) = &initial {
+        calendar.select_day(d);
+    }
+    let hour = spin(23.0, initial.as_ref().map_or(0, |d| d.hour()));
+    let minute = spin(59.0, initial.as_ref().map_or(0, |d| d.minute()));
+    let time = hbox(6);
+    time.set_halign(gtk::Align::Center);
+    time.append(&hour);
+    time.append(&gtk::Label::new(Some(":")));
+    time.append(&minute);
+
+    let clear = gtk::Button::with_label("Clear");
+    clear.set_sensitive(row.manual.is_some());
+    let set = gtk::Button::with_label("Set");
+    set.add_css_class("suggested-action");
+    let actions = hbox(6);
+    actions.set_homogeneous(true);
+    actions.append(&clear);
+    actions.append(&set);
+
+    let body = vbox(12);
+    body.append(&calendar);
+    body.append(&time);
+    body.append(&actions);
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&body));
+
+    let face = hbox(6);
+    match row.manual {
+        Some(at) => face.append(&label(&copy::wall_clock(at), &["monospace"])),
+        None => face.append(&gtk::Image::from_icon_name("x-office-calendar-symbolic")),
+    }
+    if row.manual_chosen {
+        face.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+    }
+    let button = gtk::MenuButton::builder()
+        .child(&face)
+        .popover(&popover)
+        .valign(gtk::Align::Center)
+        .tooltip_text("Set date")
+        .build();
+
+    let (c, uuid, p) = (core.clone(), row.uuid.clone(), popover.clone());
+    clear.connect_clicked(move |_| {
+        p.popdown();
+        c.dates_manual(uuid.clone(), None);
+    });
+    let (c, uuid) = (core.clone(), row.uuid.clone());
+    set.connect_clicked(move |_| {
+        let day = calendar.date();
+        let at = glib::DateTime::from_utc(
+            day.year(),
+            day.month(),
+            day.day_of_month(),
+            hour.value_as_int(),
+            minute.value_as_int(),
+            0.0,
+        );
+        popover.popdown();
+        if let Ok(at) = at {
+            c.dates_manual(uuid.clone(), Some(at.to_unix()));
+        }
+    });
+    button
+}
+
+fn date_row(row: &DateRow, core: &Arc<Core>) -> gtk::Widget {
     let b = hbox(12);
     let name = vbox(0);
     name.set_hexpand(true);
@@ -235,20 +313,20 @@ fn date_row(row: &DateRow, core: &Arc<Core>, placeholder: &str) -> gtk::Widget {
     name.set_tooltip_text(Some(&row.uuid));
     b.append(&name);
 
-    let current = label(&row.current, &["monospace"]);
+    let current = label(&copy::current_date(row.current), &["monospace"]);
     current.set_valign(gtk::Align::Center);
     b.append(&current);
 
     let options = hbox(4);
     for o in &row.options {
         let content = vbox(0);
-        content.append(&label(&o.label, &["caption", "dim-label"]));
-        let value = if o.value.is_empty() { "—" } else { &o.value };
-        content.append(&label(value, &["monospace"]));
+        content.append(&label(copy::date_key(o.key), &["caption", "dim-label"]));
+        let value = o.value.map_or_else(|| "—".to_owned(), copy::wall_clock);
+        content.append(&label(&value, &["monospace"]));
         let button = gtk::ToggleButton::new();
         button.set_child(Some(&content));
         button.set_active(o.chosen);
-        button.set_sensitive(!o.value.is_empty());
+        button.set_sensitive(o.value.is_some());
         if o.same_day {
             button.add_css_class("dim-label");
         }
@@ -257,42 +335,6 @@ fn date_row(row: &DateRow, core: &Arc<Core>, placeholder: &str) -> gtk::Widget {
         options.append(&button);
     }
     b.append(&options);
-
-    let manual = vbox(2);
-    manual.set_valign(gtk::Align::Center);
-    let entry = gtk::Entry::new();
-    entry.set_text(&row.manual);
-    entry.set_width_chars(24);
-    entry.add_css_class("monospace");
-    ui::set_class(&entry, "error", !row.manual_error.is_empty());
-    if row.manual_chosen {
-        entry.set_secondary_icon_name(Some("object-select-symbolic"));
-    }
-    entry.set_placeholder_text(Some(placeholder));
-    let commit = {
-        let (core, uuid, entry, last) = (
-            core.clone(),
-            row.uuid.clone(),
-            entry.clone(),
-            row.manual.clone(),
-        );
-        move || {
-            let text = entry.text().to_string();
-            if text != last {
-                core.dates_manual(uuid.clone(), text);
-            }
-        }
-    };
-    let on_activate = commit.clone();
-    entry.connect_activate(move |_| on_activate());
-    ui::on_focus_out(&entry, commit);
-    manual.append(&entry);
-    if !row.manual_error.is_empty() {
-        let err = label(&row.manual_error, &["error", "caption"]);
-        err.set_wrap(true);
-        err.set_max_width_chars(30);
-        manual.append(&err);
-    }
-    b.append(&manual);
+    b.append(&manual_picker(row, core));
     b.upcast()
 }

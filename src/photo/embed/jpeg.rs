@@ -1,12 +1,18 @@
-use super::{padded, replace_file, same};
+use super::{padded, same, splice_file};
 use anyhow::{Result, bail};
+use std::ops::Range;
 use std::path::Path;
 
 const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXIF_HEADER: &[u8] = b"Exif\0\0";
 
+struct Xmp {
+    segment: Range<usize>,
+    packet: Range<usize>,
+}
+
 struct Layout {
-    xmp: Option<std::ops::Range<usize>>,
+    xmp: Option<Xmp>,
     insert_at: usize,
 }
 
@@ -40,7 +46,10 @@ fn layout(data: &[u8]) -> Result<Layout> {
         let payload = &data[pos + 4..end];
         if marker == 0xe1 && payload.starts_with(XMP_HEADER) {
             if xmp.is_none() {
-                xmp = Some(pos..end);
+                xmp = Some(Xmp {
+                    segment: pos..end,
+                    packet: pos + 4 + XMP_HEADER.len()..end,
+                });
             }
             leading = false;
         } else if leading
@@ -73,31 +82,21 @@ fn segment(payload: &[u8]) -> Result<Vec<u8>> {
 
 pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
     let data = std::fs::read(path)?;
-    Ok(layout(&data)?
-        .xmp
-        .map(|r| data[r.start + 4 + XMP_HEADER.len()..r.end].to_vec()))
+    Ok(layout(&data)?.xmp.map(|x| data[x.packet].to_vec()))
 }
 
 pub fn embed(path: &Path, xmp: &str) -> Result<bool> {
-    let mut data = std::fs::read(path)?;
+    let data = std::fs::read(path)?;
     let layout = layout(&data)?;
-    let seg = match layout.xmp {
-        Some(range) => {
-            let existing = &data[range.start + 4 + XMP_HEADER.len()..range.end];
-            if same(existing, xmp) {
-                return Ok(false);
-            }
-            let seg = segment(&padded(xmp))?;
-            data.splice(range, seg);
-            data
-        }
-        None => {
-            let seg = segment(&padded(xmp))?;
-            data.splice(layout.insert_at..layout.insert_at, seg);
-            data
-        }
-    };
-    replace_file(path, &seg)?;
+    if let Some(x) = &layout.xmp
+        && same(&data[x.packet.clone()], xmp)
+    {
+        return Ok(false);
+    }
+    let range = layout
+        .xmp
+        .map_or(layout.insert_at..layout.insert_at, |x| x.segment);
+    splice_file(path, data, range, segment(&padded(xmp))?)?;
     Ok(true)
 }
 
@@ -131,7 +130,7 @@ mod tests {
         assert!(embed(&p, x1).unwrap());
         let d = std::fs::read(&p).unwrap();
         let l = layout(&d).unwrap();
-        let r = l.xmp.clone().unwrap();
+        let r = l.xmp.unwrap().segment;
         assert_eq!(r.start, 2 + 18 + 20, "after JFIF and Exif");
         assert!(d[r.start + 4..].starts_with(XMP_HEADER));
         assert!(d.ends_with(&[0xff, 0xd9]));
@@ -141,7 +140,7 @@ mod tests {
         assert!(embed(&p, x2).unwrap());
         let d2 = std::fs::read(&p).unwrap();
         assert_eq!(d2.len(), d.len() + 1);
-        assert_eq!(layout(&d2).unwrap().xmp.unwrap().start, r.start);
+        assert_eq!(layout(&d2).unwrap().xmp.unwrap().segment.start, r.start);
         assert_eq!(super::super::find(&d2, b"<x>1</x>"), None);
     }
 

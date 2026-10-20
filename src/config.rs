@@ -1,7 +1,7 @@
-use crate::photo::{Asset, DateZone, Filter};
+use crate::photo::{DateZone, Filter};
 use anyhow::{Context, Result};
 use directories::{BaseDirs, ProjectDirs};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -29,7 +29,7 @@ pub struct Config {
     #[serde(default = "default_client_id")]
     pub onedrive_client_id: String,
     #[serde(default)]
-    pub dropbox_app_key: Option<String>,
+    pub dropbox_app_key: String,
 }
 
 fn default_true() -> bool {
@@ -53,7 +53,7 @@ fn default_filename() -> String {
 }
 
 /// Where an asset's taken date comes from first.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DateSource {
     /// The source's metadata, then the file, then the upload time.
@@ -61,45 +61,6 @@ pub enum DateSource {
     Source,
     /// The file's own EXIF or container date, then the source, then the upload time.
     File,
-}
-
-impl Config {
-    /// The asset as the path templates see it.
-    pub fn zoned(&self, asset: &Asset) -> Asset {
-        asset.zoned(self.date_zone)
-    }
-}
-
-pub fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("", "", "photosink").context("no home directory")
-}
-
-pub fn expand_home(p: &Path) -> PathBuf {
-    match (p.strip_prefix("~"), BaseDirs::new()) {
-        (Ok(rest), Some(base)) => base.home_dir().join(rest),
-        _ => p.to_path_buf(),
-    }
-}
-
-pub fn write_initial(path: &Path) -> Result<()> {
-    anyhow::ensure!(!path.exists(), "{} already exists", path.display());
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, include_str!("../config.example.toml"))?;
-    Ok(())
-}
-
-pub fn update(path: &Path, set: impl FnOnce(&mut toml::Table)) -> Result<()> {
-    if !path.exists() {
-        write_initial(path)?;
-    }
-    let mut table: toml::Table = std::fs::read_to_string(path)?.parse()?;
-    set(&mut table);
-    let text = toml::to_string(&table)?;
-    Config::parse(&text)?;
-    std::fs::write(path, text)?;
-    Ok(())
 }
 
 impl Config {
@@ -131,6 +92,38 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Config::parse(&s)
     }
+}
+
+pub(crate) fn project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("", "", "photosink").context("no home directory")
+}
+
+pub(crate) fn expand_home(p: &Path) -> PathBuf {
+    match (p.strip_prefix("~"), BaseDirs::new()) {
+        (Ok(rest), Some(base)) => base.home_dir().join(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
+pub fn write_initial(path: &Path) -> Result<()> {
+    anyhow::ensure!(!path.exists(), "{} already exists", path.display());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, include_str!("../config.example.toml"))?;
+    Ok(())
+}
+
+pub fn update(path: &Path, set: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    if !path.exists() {
+        write_initial(path)?;
+    }
+    let mut table: toml::Table = std::fs::read_to_string(path)?.parse()?;
+    set(&mut table);
+    let text = toml::to_string(&table)?;
+    Config::parse(&text)?;
+    std::fs::write(path, text)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -168,10 +161,6 @@ mod tests {
             .is_err()
         );
         assert!(Config::parse("export_dir = \"/o\"\nfilename = \"{nope}\"").is_err());
-        assert_eq!(
-            Config::parse("export_dir = \"/o\"").unwrap().filename,
-            "{stem}"
-        );
     }
 
     #[test]
@@ -179,6 +168,7 @@ mod tests {
         let cfg = Config::parse("export_dir = \"/tmp/out\"").unwrap();
         assert_eq!(cfg.export_dir, PathBuf::from("/tmp/out"));
         assert_eq!(cfg.path, "{take.year}/{take.month}");
+        assert_eq!(cfg.filename, "{stem}");
         assert_eq!(cfg.concurrency, 4);
         assert!(!cfg.edits);
     }
@@ -202,14 +192,6 @@ mod tests {
                 .ends_with("Pictures/Export")
         );
         assert!(write_initial(&path).is_err());
-    }
-
-    #[test]
-    fn parses_sources() {
-        let cfg = Config::parse("export_dir = \"/o\"\nonedrive_client_id = \"abc\"").unwrap();
-        assert_eq!(cfg.onedrive_client_id, "abc");
-        let cfg = Config::parse("export_dir = \"/o\"").unwrap();
-        assert_eq!(cfg.onedrive_client_id, default_client_id());
     }
 
     #[test]

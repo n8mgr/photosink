@@ -4,8 +4,9 @@ using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using System;
 using System.Linq;
-using Windows.System;
 using uniffi.photosink_bridge;
+using Launcher = Windows.System.Launcher;
+using VirtualKey = Windows.System.VirtualKey;
 
 namespace Photosink;
 
@@ -18,7 +19,7 @@ namespace Photosink;
 internal sealed partial class TabPage : Grid
 {
     private readonly Core core;
-    private readonly TabInfo info;
+    private readonly Tab tab;
     private readonly WrapPanel subtitle = new() { HorizontalSpacing = 16, VerticalAlignment = VerticalAlignment.Center };
     private readonly InfoBar statusBar = new() { Severity = InfoBarSeverity.Error, IsClosable = false };
     private readonly InfoBar errorBar = new() { Severity = InfoBarSeverity.Error };
@@ -48,16 +49,16 @@ internal sealed partial class TabPage : Grid
     private readonly ListView list = new() { SelectionMode = ListViewSelectionMode.None };
     private readonly LazyList rows;
     private readonly DatesPane? dates;
-    private DateOption[] chooseOptions = Array.Empty<DateOption>();
     private Status? status;
+    private Tab? running;
     private bool ownsStatus = true;
     private DatesView? datesView;
     private bool resetNext;
 
-    internal TabPage(Core core, TabInfo info)
+    internal TabPage(Core core, Tab tab)
     {
         this.core = core;
-        this.info = info;
+        this.tab = tab;
         Padding = new Thickness(24, 0, 24, 0);
         for (var i = 0; i < 5; i++)
         {
@@ -66,8 +67,8 @@ internal sealed partial class TabPage : Grid
         RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
         var heading = new StackPanel { Spacing = 2 };
-        heading.Children.Add(new TextBlock { Text = info.Name, Style = Ui.Style("TitleTextBlockStyle") });
-        heading.Children.Add(Ui.Text(info.Hint, "SecondaryText"));
+        heading.Children.Add(new TextBlock { Text = Copy.TabName(tab), Style = Ui.Style("TitleTextBlockStyle") });
+        heading.Children.Add(Ui.Text(Copy.Hint(tab), "SecondaryText"));
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         buttons.Children.Add(runWrap);
         buttons.Children.Add(apply);
@@ -83,7 +84,7 @@ internal sealed partial class TabPage : Grid
         bars.Children.Add(errorBar);
         SetRow(bars, 1);
 
-        var args = core.RunArgs(info.Tab);
+        var args = core.RunArgs(tab);
         BuildForm(args);
         formHost.Content = form;
         formHost.Visibility = form.Children.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -93,7 +94,7 @@ internal sealed partial class TabPage : Grid
         BuildCommands();
         SetRow(commands, 4);
 
-        rows = new LazyList((start, count) => core.GridRows(info.Tab, (uint)start, (uint)count));
+        rows = new LazyList((start, count) => core.GridRows(tab, (uint)start, (uint)count));
         list.ItemTemplate = (DataTemplate)Application.Current.Resources["StatusRowTemplate"];
         list.ItemsSource = rows;
         list.ContainerContentChanging += (_, e) =>
@@ -113,7 +114,7 @@ internal sealed partial class TabPage : Grid
         Children.Add(commands);
         Children.Add(list);
 
-        if (info.Tab == Tab.Dates)
+        if (tab == Tab.Dates)
         {
             dates = new DatesPane(core) { Visibility = Visibility.Collapsed };
             SetRow(dates, 5);
@@ -138,7 +139,7 @@ internal sealed partial class TabPage : Grid
             }
             catch (CoreException e)
             {
-                ShowError(e.Message);
+                ShowError(Copy.ErrorText(e, tab));
             }
         };
         commands.Content = subtitle;
@@ -159,7 +160,7 @@ internal sealed partial class TabPage : Grid
         clear.Click += (_, _) =>
         {
             resetNext = true;
-            core.Clear(info.Tab);
+            core.Clear(tab);
         };
 
         commands.PrimaryCommands.Add(filter);
@@ -170,118 +171,152 @@ internal sealed partial class TabPage : Grid
 
     private void BuildForm(RunArgs args)
     {
-        if (info.Arg is { } spec)
+        switch (tab)
         {
-            var box = new TextBox
-            {
-                Text = args.Arg,
-                IsSpellCheckEnabled = false,
-            };
-            AutomationProperties.SetName(box, spec.Label);
-            box.TextChanged += (_, _) => EditArgs(a => a with { Arg = box.Text });
+            case Tab.ApplePhotos:
+                AddArg(args, "Library", "Photos library", "\uE8B7", FolderButton, false);
+                AddDryRun(args);
+                break;
+            case Tab.OneDrive:
+                AddArg(args, "Folder", "Folder under the drive root; empty for the whole drive", "\uE8B7", null, false);
+                AddDryRun(args);
+                break;
+            case Tab.Dropbox:
+                AddArg(args, "Folder", "Folder in your Dropbox; empty for everything", "\uE8B7", null, false);
+                AddDryRun(args);
+                break;
+            case Tab.GoogleTakeout:
+                AddArg(args, "Takeout", "Folder of archives, a single archive, or an extracted tree", "\uE8B7",
+                    box => FolderOrArchiveButton(box, new[] { "zip", "tgz", "gz" }), false);
+                AddDryRun(args);
+                break;
+            case Tab.Consolidate:
+                AddDryRun(args);
+                break;
+            case Tab.Clean:
+                AddOption(args, "Also delete files the state doesn't reference");
+                AddDryRun(args);
+                break;
+            case Tab.Dates:
+                AddArg(args, "Find", "Leave empty to list only assets whose date disagrees with the file", "\uE721", null, true);
+                break;
+        }
+    }
+
+    private void AddArg(RunArgs args, string label, string description, string glyph, Func<TextBox, FrameworkElement>? browse, bool runOnEnter)
+    {
+        var box = new TextBox
+        {
+            Text = args.Arg,
+            IsSpellCheckEnabled = false,
+        };
+        AutomationProperties.SetName(box, label);
+        box.TextChanged += (_, _) => EditArgs(a => a with { Arg = box.Text });
+        if (runOnEnter)
+        {
             box.KeyDown += (_, e) =>
             {
-                if (e.Key == VirtualKey.Enter && spec.RunOnEnter)
+                if (e.Key == VirtualKey.Enter)
                 {
                     e.Handled = true;
                     Run();
                 }
             };
-            var row = new Grid { ColumnSpacing = 8 };
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            row.Children.Add(box);
-            if (Browse(spec, box) is { } browse)
-            {
-                SetColumn(browse, 1);
-                row.Children.Add(browse);
-            }
-            form.Children.Add(new SettingsCard
-            {
-                Header = spec.Label,
-                Description = spec.Placeholder,
-                HeaderIcon = new FontIcon { Glyph = spec.RunOnEnter ? "\uE721" : "\uE8B7" },
-                ContentAlignment = ContentAlignment.Vertical,
-                HorizontalContentAlignment = HorizontalAlignment.Stretch,
-                Content = row,
-            });
         }
-        if (info.Option is { } label)
+        var row = new Grid { ColumnSpacing = 8 };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        row.Children.Add(box);
+        if (browse?.Invoke(box) is { } button)
         {
-            var toggle = new ToggleSwitch { IsOn = args.Option };
-            toggle.Toggled += (_, _) => EditArgs(a => a with { Option = toggle.IsOn });
-            form.Children.Add(new SettingsCard
-            {
-                Header = label,
-                HeaderIcon = new FontIcon { Glyph = "\uE74D" },
-                Content = toggle,
-            });
+            SetColumn(button, 1);
+            row.Children.Add(button);
         }
-        if (info.DryRun)
+        form.Children.Add(new SettingsCard
         {
-            dry.IsOn = args.Dry;
-            dry.Toggled += (_, _) => EditArgs(a => a with { Dry = dry.IsOn });
-            form.Children.Add(new SettingsCard
-            {
-                Header = "Dry run",
-                HeaderIcon = new FontIcon { Glyph = "\uE890" },
-                Content = dry,
-            });
-        }
+            Header = label,
+            Description = description,
+            HeaderIcon = new FontIcon { Glyph = glyph },
+            ContentAlignment = ContentAlignment.Vertical,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            Content = row,
+        });
     }
 
-    private FrameworkElement? Browse(ArgSpec spec, TextBox box)
+    private void AddOption(RunArgs args, string label)
     {
-        switch (spec.Picker)
+        var toggle = new ToggleSwitch { IsOn = args.Option };
+        toggle.Toggled += (_, _) => EditArgs(a => a with { Option = toggle.IsOn });
+        form.Children.Add(new SettingsCard
         {
-            case PickerKind.None:
-                return null;
-            case PickerKind.FolderOrArchive:
-                var folder = new MenuFlyoutItem { Text = "Folder…" };
-                folder.Click += async (_, _) =>
-                {
-                    if (await Pickers.Folder(this) is { } path)
-                    {
-                        box.Text = path;
-                    }
-                };
-                var archive = new MenuFlyoutItem { Text = "Archive…" };
-                archive.Click += async (_, _) =>
-                {
-                    if (await Pickers.File(this, spec.Extensions) is { } path)
-                    {
-                        box.Text = path;
-                    }
-                };
-                var menu = new MenuFlyout();
-                menu.Items.Add(folder);
-                menu.Items.Add(archive);
-                return new DropDownButton { Content = "Browse", Flyout = menu };
-            default:
-                var button = new Button { Content = "Browse…" };
-                button.Click += async (_, _) =>
-                {
-                    if (await Pickers.Folder(this) is { } path)
-                    {
-                        box.Text = path;
-                    }
-                };
-                return button;
-        }
+            Header = label,
+            HeaderIcon = new FontIcon { Glyph = "\uE74D" },
+            Content = toggle,
+        });
+    }
+
+    private void AddDryRun(RunArgs args)
+    {
+        dry.IsOn = args.Dry;
+        dry.Toggled += (_, _) => EditArgs(a => a with { Dry = dry.IsOn });
+        form.Children.Add(new SettingsCard
+        {
+            Header = "Dry run",
+            HeaderIcon = new FontIcon { Glyph = "\uE890" },
+            Content = dry,
+        });
+    }
+
+    private FrameworkElement FolderButton(TextBox box)
+    {
+        var button = new Button { Content = "Browse…" };
+        button.Click += async (_, _) =>
+        {
+            if (await Pickers.Folder(this) is { } path)
+            {
+                box.Text = path;
+            }
+        };
+        return button;
+    }
+
+    private FrameworkElement FolderOrArchiveButton(TextBox box, string[] extensions)
+    {
+        var folder = new MenuFlyoutItem { Text = "Folder…" };
+        folder.Click += async (_, _) =>
+        {
+            if (await Pickers.Folder(this) is { } path)
+            {
+                box.Text = path;
+            }
+        };
+        var archive = new MenuFlyoutItem { Text = "Archive…" };
+        archive.Click += async (_, _) =>
+        {
+            if (await Pickers.File(this, extensions) is { } path)
+            {
+                box.Text = path;
+            }
+        };
+        var menu = new MenuFlyout();
+        menu.Items.Add(folder);
+        menu.Items.Add(archive);
+        return new DropDownButton { Content = "Browse", Flyout = menu };
     }
 
     private void BuildFilterMenu()
     {
         filterMenu.Items.Clear();
-        var chips = core.Chips(info.Tab);
+        var chips = core.Chips(tab);
         var only = new MenuFlyoutSubItem { Text = "Show only" };
         foreach (var chip in chips)
         {
             var state = chip.State;
-            var item = new ToggleMenuFlyoutItem { Text = $"{chip.Label}  {chip.Count}", IsChecked = !chip.Hidden };
+            var label = Copy.ChipLabel(state);
+            var item = new ToggleMenuFlyoutItem { Text = $"{label}  {Copy.Count(chip.Count)}", IsChecked = !chip.Hidden };
             item.Click += (_, _) => ToggleChip(state, false);
             filterMenu.Items.Add(item);
-            var just = new MenuFlyoutItem { Text = chip.Label };
+            var just = new MenuFlyoutItem { Text = label };
             just.Click += (_, _) => ToggleChip(state, true);
             only.Items.Add(just);
         }
@@ -291,7 +326,7 @@ internal sealed partial class TabPage : Grid
         all.Click += (_, _) =>
         {
             resetNext = true;
-            core.ShowAll(info.Tab);
+            core.ShowAll(tab);
         };
         filterMenu.Items.Add(all);
     }
@@ -299,10 +334,9 @@ internal sealed partial class TabPage : Grid
     private void BuildChooseMenu()
     {
         chooseMenu.Items.Clear();
-        foreach (var option in chooseOptions)
+        foreach (var key in Copy.DateKeys)
         {
-            var key = option.Key;
-            var item = new MenuFlyoutItem { Text = option.Label };
+            var item = new MenuFlyoutItem { Text = Copy.KeyLabel(key) };
             item.Click += (_, _) => core.DatesPickAll(key);
             chooseMenu.Items.Add(item);
         }
@@ -315,35 +349,36 @@ internal sealed partial class TabPage : Grid
     private void ToggleChip(RowState state, bool only)
     {
         resetNext = true;
-        core.ToggleChip(info.Tab, state, only);
+        core.ToggleChip(tab, state, only);
     }
 
     private void EditArgs(Func<RunArgs, RunArgs> change)
     {
-        var args = core.RunArgs(info.Tab);
+        var args = core.RunArgs(tab);
         var next = change(args);
         if (next != args)
         {
-            core.SetRunArgs(info.Tab, next);
+            core.SetRunArgs(tab, next);
             RefreshTask();
         }
     }
 
     private async void Run()
     {
-        if (core.Blocker(info.Tab) is not null)
+        if (core.Blocker(tab) is not null)
         {
             return;
         }
-        if (core.Confirmation(info.Tab) is { } confirm)
+        if (core.Confirmation(tab) is { } confirmation)
         {
+            var (title, message, ok) = Copy.ConfirmationText(confirmation);
             var dialog = new ContentDialog
             {
                 XamlRoot = XamlRoot,
                 Style = Ui.Style("DefaultContentDialogStyle"),
-                Title = confirm.Title,
-                Content = new TextBlock { Text = confirm.Message, TextWrapping = TextWrapping.Wrap },
-                PrimaryButtonText = confirm.Ok,
+                Title = title,
+                Content = new TextBlock { Text = message, TextWrapping = TextWrapping.Wrap },
+                PrimaryButtonText = ok,
                 CloseButtonText = "Cancel",
                 DefaultButton = ContentDialogButton.Close,
             };
@@ -354,24 +389,28 @@ internal sealed partial class TabPage : Grid
         }
         try
         {
-            core.Start(info.Tab);
+            core.Start(tab);
             errorBar.IsOpen = false;
         }
         catch (CoreException e)
         {
-            ShowError(e.Message);
+            ShowError(Copy.ErrorText(e, tab));
         }
     }
 
-    private void Open(string path)
+    private async void Open(string path)
     {
         try
         {
-            core.OpenPath(path);
+            var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
+            if (!await Launcher.LaunchFileAsync(file))
+            {
+                ShowError($"{path}: no app opens this file");
+            }
         }
-        catch (CoreException e)
+        catch (Exception e)
         {
-            ShowError(e.Message);
+            ShowError($"{path}: {e.Message}");
         }
     }
 
@@ -408,7 +447,7 @@ internal sealed partial class TabPage : Grid
     {
         subtitle.Children.Clear();
         var picking = datesView?.Shown == true;
-        var text = picking ? datesView!.Summary : ownsStatus && status is { Error: false } s ? s.Text : "";
+        var text = picking ? Copy.DatesSummary(datesView!) : ownsStatus && status is { } s && !Copy.IsError(s) ? Copy.StatusText(s) : "";
         if (text.Length > 0)
         {
             subtitle.Children.Add(Ui.Text(text, "SecondaryText"));
@@ -417,36 +456,37 @@ internal sealed partial class TabPage : Grid
         {
             return;
         }
-        foreach (var stat in core.Stats(info.Tab))
+        foreach (var stat in core.Stats(tab))
         {
             var pair = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
-            pair.Children.Add(Ui.Text(stat.Label, "SecondaryText"));
-            pair.Children.Add(Ui.Text(stat.Value, "StrongText"));
+            pair.Children.Add(Ui.Text(Copy.StatLabel(stat.Kind), "SecondaryText"));
+            pair.Children.Add(Ui.Text(Copy.Count(stat.Count), "StrongText"));
             subtitle.Children.Add(pair);
         }
     }
 
     private void RefreshClear()
     {
-        clear.IsEnabled = status?.Running != info.Tab && core.GridLen(info.Tab) > 0;
+        clear.IsEnabled = running != tab && core.GridLen(tab) > 0;
     }
 
     internal void RefreshTask()
     {
-        run.Content = core.RunLabel(info.Tab);
-        var blocker = core.Blocker(info.Tab);
+        run.Content = Copy.RunLabel(tab, core.RunArgs(tab));
+        var blocker = core.Blocker(tab);
         run.IsEnabled = blocker is null;
-        ToolTipService.SetToolTip(runWrap, blocker);
+        ToolTipService.SetToolTip(runWrap, blocker is null ? null : Copy.BlockerText(tab, blocker));
     }
 
     /// <summary>Shows the window's status; <paramref name="owns"/> is false when it belongs to another tab's run.</summary>
-    internal void RefreshStatus(Status next, bool owns)
+    internal void RefreshStatus(Status next, Tab? runningTab, bool owns)
     {
         status = next;
+        running = runningTab;
         ownsStatus = owns;
-        statusBar.Title = next.Text;
-        statusBar.IsOpen = owns && next.Error;
-        formHost.IsEnabled = next.Running is null;
+        statusBar.Title = Copy.StatusText(next);
+        statusBar.IsOpen = owns && Copy.IsError(next);
+        formHost.IsEnabled = runningTab is null;
         RefreshTask();
         RefreshClear();
         RefreshSubtitle();
@@ -455,12 +495,12 @@ internal sealed partial class TabPage : Grid
 
     internal void RefreshGrid()
     {
-        var chips = core.Chips(info.Tab);
-        var hidden = core.HiddenRows(info.Tab);
+        var chips = core.Chips(tab);
+        var hidden = core.HiddenRows(tab);
         filter.IsEnabled = chips.Length > 0;
-        filter.Label = chips.Any(c => c.Hidden) ? $"Filter · {hidden} hidden" : "Filter";
+        filter.Label = chips.Any(c => c.Hidden) ? $"Filter · {Copy.Count(hidden)} hidden" : "Filter";
 
-        var added = rows.Refresh((int)core.GridLen(info.Tab), resetNext);
+        var added = rows.Refresh((int)core.GridLen(tab), resetNext);
         resetNext = false;
         RenderRealized();
         if (added && follow.IsChecked == true)
@@ -480,15 +520,15 @@ internal sealed partial class TabPage : Grid
         var view = core.DatesView();
         datesView = view;
         var picking = view.Shown;
-        chooseOptions = dates.Refresh(view);
+        dates.Refresh(view);
 
         dates.Visibility = picking ? Visibility.Visible : Visibility.Collapsed;
         list.Visibility = picking ? Visibility.Collapsed : Visibility.Visible;
         var rowCommands = picking ? Visibility.Collapsed : Visibility.Visible;
         filter.Visibility = follow.Visibility = clear.Visibility = rowCommands;
         chooseAll.Visibility = apply.Visibility = picking ? Visibility.Visible : Visibility.Collapsed;
-        chooseAll.IsEnabled = view.CanPick && chooseOptions.Length > 0;
-        apply.Content = view.ApplyLabel;
+        chooseAll.IsEnabled = view.CanPick && view.Rows > 0;
+        apply.Content = Copy.DatesApply(view);
         apply.IsEnabled = view.CanApply;
         run.Style = Ui.Style(picking ? "DefaultButtonStyle" : "AccentButtonStyle");
         progress.Visibility = view.Scanning ? Visibility.Visible : Visibility.Collapsed;

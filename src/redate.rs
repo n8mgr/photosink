@@ -9,68 +9,39 @@ use crate::photo::exif;
 use crate::state::State;
 use crate::{Event, Progress};
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, FixedOffset, Local, NaiveDateTime, TimeZone};
 use std::path::Path;
 
 pub const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub uuid: String,
     pub stem: String,
     pub dir: String,
     pub video: bool,
-    pub current: Option<String>,
-    pub create: Option<String>,
-    pub original: Option<String>,
-    pub modify: Option<String>,
+    pub current: Option<NaiveDateTime>,
+    pub create: Option<NaiveDateTime>,
+    pub original: Option<NaiveDateTime>,
+    pub modify: Option<NaiveDateTime>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A new taken date for an asset, as wall-clock time read in the asset's
+/// existing offset.
+#[derive(Debug, Clone)]
 pub struct Choice {
     pub uuid: String,
-    pub taken: String,
-}
-
-fn fmt(t: NaiveDateTime) -> String {
-    t.format(FORMAT).to_string()
-}
-
-enum Parsed {
-    /// Carries its own offset, used as given.
-    Zoned(DateTime<FixedOffset>),
-    /// Wall-clock only; read in the asset's existing offset.
-    Naive(NaiveDateTime),
-}
-
-fn parse(s: &str) -> Result<Parsed> {
-    let s = s.trim();
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(Parsed::Zoned(t));
-    }
-    NaiveDateTime::parse_from_str(s, FORMAT)
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .or_else(|_| {
-            NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-        })
-        .map(Parsed::Naive)
-        .with_context(|| format!("date {s:?} is not YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or RFC 3339"))
-}
-
-/// Checks that `s` is a date `apply` accepts.
-pub fn check(s: &str) -> Result<()> {
-    parse(s).map(|_| ())
+    pub taken: NaiveDateTime,
 }
 
 fn media_file(state: &State, uuid: &str) -> Result<Option<String>> {
-    if let Some(p) = state.exported(uuid, "original")? {
+    if let Some(p) = state.exported(uuid, crate::sources::Kind::Original)? {
         return Ok(Some(p));
     }
     Ok(state
         .exports_of(uuid)?
         .into_iter()
-        .find(|(kind, _)| kind != "adjustments")
+        .find(|(kind, _)| *kind != crate::sources::Kind::Adjustments)
         .map(|(_, p)| p))
 }
 
@@ -89,13 +60,8 @@ fn differs(current: Option<NaiveDateTime>, dates: &exif::Dates) -> bool {
 
 /// With `query`, lists every asset whose folder, stem or original filename
 /// contains it, flagged or not; without, only those whose date disagrees with
-/// the file.
-pub fn scan(
-    cfg: &Config,
-    state: &State,
-    query: Option<&str>,
-    progress: Progress,
-) -> Result<Vec<Candidate>> {
+/// the file. Each is reported as an `Event::Flagged`.
+pub fn scan(cfg: &Config, state: &State, query: Option<&str>, progress: Progress) -> Result<()> {
     let assets = state.assets_under(&cfg.export_dir.to_string_lossy())?;
     let total = assets.len();
     let query = query
@@ -106,38 +72,37 @@ pub fn scan(
         total,
         query: query.clone(),
     });
-    let mut out = Vec::new();
+    let mut flagged = 0;
     for (n, (uuid, dir, stem)) in assets.iter().enumerate() {
         if n % 100 == 99 {
             progress(Event::Checked {
                 n: n + 1,
                 total,
-                flagged: out.len(),
+                flagged,
             });
-        }
-        if let Some(q) = &query
-            && !(stem.to_lowercase().contains(q) || dir.to_lowercase().contains(q))
-            && !crate::export::stored_asset(state, dir, stem, uuid)?
-                .is_some_and(|a| a.filename.to_lowercase().contains(q))
-        {
-            continue;
         }
         let Some(asset) = crate::export::stored_asset(state, dir, stem, uuid)? else {
             continue;
         };
-        // Same wall-clock reading the path template uses, so a UTC-stamped source
-        // date is compared to the file's naive EXIF time without a zone shift.
+        if let Some(q) = &query
+            && !(stem.to_lowercase().contains(q)
+                || dir.to_lowercase().contains(q)
+                || asset.filename.to_lowercase().contains(q))
+        {
+            continue;
+        }
         let current = asset.taken.map(|t| t.naive_local());
         let Some(file) = media_file(state, uuid)? else {
             continue;
         };
-        let dates = exif::dates(Path::new(&file));
+        let dates = exif::read_metadata(Path::new(&file)).dates;
         if query.is_none()
             && (!differs(current, &dates) || (current.is_some() && dates == exif::Dates::default()))
         {
             continue;
         }
-        let c = Candidate {
+        flagged += 1;
+        progress(Event::Flagged(Candidate {
             uuid: uuid.clone(),
             stem: stem.clone(),
             dir: Path::new(dir)
@@ -145,20 +110,18 @@ pub fn scan(
                 .map(|r| r.display().to_string())
                 .unwrap_or_else(|_| dir.clone()),
             video: asset.video,
-            current: current.map(fmt),
-            create: dates.create.map(fmt),
-            original: dates.original.map(fmt),
-            modify: dates.modify.map(fmt),
-        };
-        progress(Event::Flagged(c.clone()));
-        out.push(c);
+            current,
+            create: dates.create,
+            original: dates.original,
+            modify: dates.modify,
+        }));
     }
     progress(Event::Checked {
         n: total,
         total,
-        flagged: out.len(),
+        flagged,
     });
-    Ok(out)
+    Ok(())
 }
 
 fn zoned(naive: NaiveDateTime, like: Option<DateTime<FixedOffset>>) -> DateTime<FixedOffset> {
@@ -176,6 +139,39 @@ fn zoned(naive: NaiveDateTime, like: Option<DateTime<FixedOffset>>) -> DateTime<
     }
 }
 
+/// Redates asset `n` of `total`, at `dir`/`stem`.
+fn redate(
+    cfg: &Config,
+    state: &State,
+    c: &Choice,
+    (dir, stem): (&str, &str),
+    pos: (usize, usize),
+    progress: Progress,
+) -> Result<()> {
+    let sidecar = Path::new(dir).join(format!("{stem}.xmp"));
+    let mut asset = crate::export::stored_asset(state, dir, stem, &c.uuid)?
+        .context("no metadata in sidecar or files")?;
+    let new = zoned(c.taken, asset.taken);
+    let old = asset.taken.map(|t| t.naive_local());
+    asset.taken = Some(new);
+    state.set(&format!("taken:{}", c.uuid), &new.to_rfc3339())?;
+    let xmp = crate::photo::xmp::write(&asset);
+    if cfg.sidecar || sidecar.exists() {
+        std::fs::write(&sidecar, &xmp)?;
+    }
+    if cfg.embed {
+        crate::export::embed_asset(state, &cfg.export_dir, &c.uuid, &xmp, pos, progress)?;
+    }
+    progress(Event::Redated {
+        stem: stem.to_owned(),
+        from: old,
+        to: new.naive_local(),
+    });
+    Ok(())
+}
+
+/// Redates each chosen asset, reporting the ones that fail, then moves every
+/// redated asset to the folder the template now produces.
 pub fn apply(
     cfg: &Config,
     state: &State,
@@ -185,42 +181,22 @@ pub fn apply(
     let mut done = Vec::new();
     let total = choices.len();
     for (i, c) in choices.iter().enumerate() {
+        let pos = (i + 1, total);
         let Some((dir, stem)) = state.location(&c.uuid)? else {
-            progress(Event::error(&c.uuid, "not in the state DB"));
+            progress(Event::error_at(
+                pos.0,
+                total,
+                &c.uuid,
+                "not in the state DB",
+            ));
             continue;
         };
-        let sidecar = Path::new(&dir).join(format!("{stem}.xmp"));
-        let mut asset = crate::export::stored_asset(state, &dir, &stem, &c.uuid)?
-            .with_context(|| format!("{stem}: no metadata in sidecar or files"))?;
-        let new = match parse(&c.taken)? {
-            Parsed::Zoned(t) => t,
-            Parsed::Naive(n) => zoned(n, asset.taken),
-        };
-        let old = asset.taken.map(|t| t.format(FORMAT).to_string());
-        asset.taken = Some(new);
-        state.set(&format!("taken:{}", c.uuid), &new.to_rfc3339())?;
-        let xmp = crate::photo::xmp::write(&asset);
-        if cfg.sidecar || sidecar.exists() {
-            std::fs::write(&sidecar, &xmp)?;
+        match redate(cfg, state, c, (&dir, &stem), pos, progress) {
+            Ok(()) => done.push((pos.0, (c.uuid.clone(), dir, stem))),
+            Err(e) => progress(Event::error_at(pos.0, total, &stem, format!("{e:#}"))),
         }
-        if cfg.embed {
-            crate::export::embed_asset(
-                state,
-                &cfg.export_dir,
-                &c.uuid,
-                &xmp,
-                (i + 1, total),
-                progress,
-            )?;
-        }
-        progress(Event::Redated {
-            stem: stem.clone(),
-            from: old.unwrap_or_else(|| "none".into()),
-            to: new.format(FORMAT).to_string(),
-        });
-        done.push(c.uuid.clone());
     }
-    consolidate::assets(cfg, state, &done, progress)
+    consolidate::assets(cfg, state, &done, total, progress)
 }
 
 #[cfg(test)]
@@ -232,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn flags_only_disagreement_with_create_date() {
+    fn create_date_alone_decides_when_present() {
         let cur = Some(at("2016-11-28 10:00:00"));
         let d = exif::Dates {
             original: Some(at("2000-09-19 00:33:35")),
@@ -242,48 +218,184 @@ mod tests {
         assert!(differs(cur, &d));
         assert!(
             !differs(Some(at("2000-09-19 23:59:00")), &d),
-            "same day as create is fine"
+            "same day as create is fine, whatever modify says"
         );
-        let no_create = exif::Dates {
-            create: None,
-            ..exif::Dates::default()
-        };
-        assert!(!differs(cur, &no_create), "nothing to compare against");
+        assert!(differs(None, &exif::Dates::default()), "no date at all");
+    }
+
+    #[test]
+    fn falls_back_to_original_and_modify_without_create() {
+        let cur = Some(at("2016-11-28 10:00:00"));
+        assert!(
+            !differs(cur, &exif::Dates::default()),
+            "nothing to compare against"
+        );
         let modify_only = exif::Dates {
             modify: Some(at("2008-09-22 18:48:43")),
             ..exif::Dates::default()
         };
         assert!(differs(cur, &modify_only));
-        assert!(differs(None, &exif::Dates::default()));
+        assert!(!differs(Some(at("2008-09-22 01:00:00")), &modify_only));
+    }
+
+    /// Little-endian TIFF whose IFD0 holds only ModifyDate.
+    fn tiff_dated(date: &str) -> Vec<u8> {
+        let mut d = b"II*\0\x08\0\0\0".to_vec();
+        d.extend_from_slice(&1u16.to_le_bytes());
+        d.extend_from_slice(&0x0132u16.to_le_bytes());
+        d.extend_from_slice(&2u16.to_le_bytes());
+        d.extend_from_slice(&20u32.to_le_bytes());
+        d.extend_from_slice(&26u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(date.as_bytes());
+        d.push(0);
+        d
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        cfg: Config,
+        state: State,
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            let root = tempfile::tempdir().unwrap();
+            let out = root.path().join("out");
+            let cfg = Config::parse(&format!(
+                "export_dir = \"{}\"\npath = \"{{take.year}}\"\nembed = false",
+                out.display()
+            ))
+            .unwrap();
+            let state = State::open(&root.path().join("state.sqlite")).unwrap();
+            Fixture { root, cfg, state }
+        }
+
+        fn dir(&self, year: &str) -> std::path::PathBuf {
+            self.root.path().join("out").join(year)
+        }
+
+        /// An asset taken 2016-11-28 in `2016/`, its file holding `bytes`.
+        fn seed(&self, uuid: &str, stem: &str, bytes: &[u8], sidecar: bool) {
+            let dir = self.dir("2016");
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir_s = dir.to_string_lossy();
+            assert!(self.state.claim_stem(uuid, &dir_s, stem).unwrap());
+            let file = dir.join(format!("{stem}.tif"));
+            std::fs::write(&file, bytes).unwrap();
+            self.state
+                .record(
+                    uuid,
+                    crate::sources::Kind::Original,
+                    &format!("h{uuid}"),
+                    &file.to_string_lossy(),
+                )
+                .unwrap();
+            if sidecar {
+                let asset = crate::photo::Asset {
+                    uuid: uuid.into(),
+                    filename: format!("{stem}.tif"),
+                    taken: DateTime::parse_from_rfc3339("2016-11-28T10:00:00+00:00").ok(),
+                    ..Default::default()
+                };
+                std::fs::write(
+                    dir.join(format!("{stem}.xmp")),
+                    crate::photo::xmp::write(&asset),
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    fn collect(f: impl FnOnce(Progress)) -> Vec<Event> {
+        let events = std::sync::Mutex::new(Vec::new());
+        f(&|e| events.lock().unwrap().push(e));
+        events.into_inner().unwrap()
+    }
+
+    fn flagged(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Flagged(c) => Some(c.uuid.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn current_is_read_in_the_assets_own_offset() {
-        let utc = DateTime::parse_from_rfc3339("2000-09-19T00:33:23+00:00").unwrap();
-        let d = exif::Dates {
-            create: Some(at("2000-09-19 00:33:23")),
-            ..exif::Dates::default()
+    fn scan_flags_disagreeing_files_and_query_lists_any_match() {
+        let f = Fixture::new();
+        f.seed("A", "IMG_1", &tiff_dated("2008:09:22 18:48:43"), true);
+        f.seed("B", "IMG_2", &tiff_dated("2016:11:28 08:00:00"), true);
+        f.seed("C", "IMG_3", b"no exif", true);
+        let events = collect(|p| scan(&f.cfg, &f.state, None, p).unwrap());
+        assert_eq!(flagged(&events), ["A"]);
+        match events.iter().find(|e| matches!(e, Event::Flagged(_))) {
+            Some(Event::Flagged(c)) => {
+                assert_eq!(c.dir, "2016");
+                assert_eq!(c.current, Some(at("2016-11-28 10:00:00")));
+                assert_eq!(c.modify, Some(at("2008-09-22 18:48:43")));
+            }
+            _ => unreachable!(),
+        }
+        let events = collect(|p| scan(&f.cfg, &f.state, Some(" img_3 "), p).unwrap());
+        assert_eq!(
+            flagged(&events),
+            ["C"],
+            "a query lists matches unflagged too"
+        );
+    }
+
+    #[test]
+    fn apply_skips_failures_and_still_moves_the_rest() {
+        let f = Fixture::new();
+        f.seed("A", "IMG_1", b"a", true);
+        f.seed("B", "IMG_2", b"b", false);
+        f.seed("C", "IMG_3", b"c", true);
+        f.seed("D", "IMG_4", b"d", true);
+        let choice = |uuid: &str, taken: &str| Choice {
+            uuid: uuid.into(),
+            taken: at(taken),
         };
-        assert!(!differs(Some(utc.naive_local()), &d));
-    }
-
-    fn naive(s: &str) -> NaiveDateTime {
-        match parse(s).unwrap() {
-            Parsed::Naive(n) => n,
-            Parsed::Zoned(t) => panic!("{s} parsed with offset {t}"),
-        }
+        let choices = [
+            choice("A", "2008-09-22 00:00:00"),
+            choice("B", "2008-09-22 00:00:00"),
+            choice("Z", "2008-09-22 00:00:00"),
+            choice("D", "2009-01-01 12:00:00"),
+        ];
+        let mut moved = None;
+        let events = collect(|p| moved = Some(apply(&f.cfg, &f.state, &choices, p).unwrap()));
+        let errors: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Error {
+                    n: Some(n),
+                    subject,
+                    ..
+                } => Some((*n, subject.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, [(2, "IMG_2"), (3, "Z")]);
+        let moves: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Moved { n, stem, .. } => Some((*n, stem.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moves, [(1, "IMG_1"), (4, "IMG_4")], "numbered as chosen");
+        assert_eq!(moved.unwrap().moved, 2);
+        assert!(f.dir("2008").join("IMG_1.tif").exists());
+        assert!(f.dir("2009").join("IMG_4.xmp").exists());
+        assert!(f.dir("2016").join("IMG_2.tif").exists());
+        assert!(f.dir("2016").join("IMG_3.tif").exists());
+        assert!(f.state.get("taken:C").unwrap().is_none());
     }
 
     #[test]
-    fn parses_choices_and_keeps_offset() {
-        assert_eq!(naive("2008-09-22 18:48:43"), at("2008-09-22 18:48:43"));
-        assert_eq!(naive("2008-09-22T18:48:43"), at("2008-09-22 18:48:43"));
-        assert_eq!(naive(" 2008-09-22 "), at("2008-09-22 00:00:00"));
-        match parse("2008-09-19T01:33:03+00:00").unwrap() {
-            Parsed::Zoned(t) => assert_eq!(t.to_rfc3339(), "2008-09-19T01:33:03+00:00"),
-            Parsed::Naive(_) => panic!("offset dropped"),
-        }
-        assert!(parse("22/09/2008").is_err());
+    fn choices_keep_the_asset_offset() {
         let like = DateTime::parse_from_rfc3339("2016-11-28T10:00:00+01:00").unwrap();
         let z = zoned(at("2008-09-22 18:48:43"), Some(like));
         assert_eq!(z.to_rfc3339(), "2008-09-22T18:48:43+01:00");

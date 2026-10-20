@@ -1,3 +1,4 @@
+mod copy;
 mod dates_view;
 mod lazy_list;
 mod settings_panel;

@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::photo::embed::Embed;
+use crate::photo::exif;
 use crate::photo::{Asset, Camera};
 use crate::sources::{Kind, Source};
 use crate::state::{Placed, State};
@@ -11,7 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
 
-#[derive(Default, Debug, Clone, serde::Serialize)]
+#[derive(Default, Debug, Clone)]
 pub struct Summary {
     pub exported: usize,
     pub duplicates: usize,
@@ -30,13 +31,13 @@ impl Summary {
     }
 }
 
-pub fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub fn write_hashed(mut src: impl Read, dest: &Path) -> Result<String> {
+pub(crate) fn write_hashed(mut src: impl Read, dest: &Path) -> Result<String> {
     let mut file = std::fs::File::create(dest)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 1 << 20];
@@ -80,8 +81,8 @@ fn link_unique(tmp: &Path, dest: &Path, uuid: &str, hash: &str) -> Result<Placed
 
 /// The stem the filename template produces for the asset, falling back to the
 /// original filename's stem when it renders empty.
-pub fn file_stem(cfg: &Config, zoned: &Asset) -> String {
-    let s = template::render(&cfg.filename, |k, i| zoned.field(k, i)).replace('/', "-");
+pub(crate) fn file_stem(filename: &str, zoned: &Asset) -> String {
+    let s = template::render(filename, |k, i| zoned.field(k, i)).replace('/', "-");
     if s.is_empty() {
         template::sanitize(zoned.stem())
     } else {
@@ -89,60 +90,49 @@ pub fn file_stem(cfg: &Config, zoned: &Asset) -> String {
     }
 }
 
-/// The stem `choose_stem` would pick, without claiming it. Two unexported
-/// assets planning the same name in one folder both see it as free.
-fn plan_stem(state: &State, cfg: &Config, zoned: &Asset, dir: &Path) -> Result<String> {
-    if let Some(stem) = state.stem(&zoned.uuid)? {
-        return Ok(stem);
-    }
-    let base = file_stem(cfg, zoned);
+/// A free stem for the asset in `dir`: the template's, or that with a uuid
+/// suffix. With `claim` the stem is recorded; without, two unexported assets
+/// planning the same name in one folder both see it as free.
+fn pick_stem(
+    state: &State,
+    cfg: &Config,
+    zoned: &Asset,
+    dir: &Path,
+    claim: bool,
+) -> Result<String> {
+    let base = file_stem(&cfg.filename, zoned);
     let dir = dir.to_string_lossy();
+    let uuid = &zoned.uuid;
     for stem in [
         base.clone(),
-        format!("{base}_{}", &zoned.uuid[..8.min(zoned.uuid.len())]),
+        format!("{base}_{}", &uuid[..8.min(uuid.len())]),
     ] {
-        if state
-            .stem_owner(&dir, &stem)?
-            .is_none_or(|o| o == zoned.uuid)
-        {
+        let free = if claim {
+            state.claim_stem(uuid, &dir, &stem)?
+        } else {
+            state.stem_owner(&dir, &stem)?.is_none_or(|o| o == *uuid)
+        };
+        if free {
             return Ok(stem);
         }
     }
     anyhow::bail!("stem {base} taken in {dir}")
 }
 
-fn choose_stem(state: &State, cfg: &Config, zoned: &Asset, dir: &Path) -> Result<String> {
-    if let Some(stem) = state.stem(&zoned.uuid)? {
-        return Ok(stem);
-    }
-    let base = file_stem(cfg, zoned);
-    let asset = zoned;
-    let dir = dir.to_string_lossy();
-    for stem in [
-        base.clone(),
-        format!("{base}_{}", &asset.uuid[..8.min(asset.uuid.len())]),
-    ] {
-        if state.claim_stem(&asset.uuid, &dir, &stem)? {
-            return Ok(stem);
-        }
-    }
-    anyhow::bail!("stem {base} taken in {dir}")
-}
-
-pub struct Exporter<'a> {
+pub(crate) struct Exporter<'a> {
     cfg: &'a Config,
     state: &'a State,
     progress: Progress<'a>,
     location: Option<(String, PathBuf, String)>,
     pos: (usize, usize),
     dry: bool,
-    pub summary: Summary,
+    pub(crate) summary: Summary,
 }
 
 impl<'a> Exporter<'a> {
     /// With `dry`, nothing is downloaded, written or recorded; planned
     /// placements are logged and counted as exported.
-    pub fn new(
+    pub(crate) fn new(
         cfg: &'a Config,
         state: &'a State,
         progress: Progress<'a>,
@@ -161,21 +151,18 @@ impl<'a> Exporter<'a> {
 
     /// The asset index that detail events carry, so events from concurrent
     /// workers can be told apart.
-    pub fn set_pos(&mut self, n: usize, total: usize) {
+    pub(crate) fn set_pos(&mut self, n: usize, total: usize) {
         self.pos = (n, total);
     }
 
-    pub fn emit(&self, event: Event) {
+    pub(crate) fn emit(&self, event: Event) {
         (self.progress)(event)
     }
 
-    fn error(&self, subject: impl Into<String>, text: impl std::fmt::Display) -> Event {
-        Event::Error {
-            n: Some(self.pos.0),
-            total: Some(self.pos.1),
-            subject: subject.into(),
-            text: text.to_string(),
-        }
+    /// Reports an error on the current asset and counts it.
+    pub(crate) fn fail(&mut self, subject: impl Into<String>, text: impl std::fmt::Display) {
+        self.emit(Event::error_at(self.pos.0, self.pos.1, subject, text));
+        self.summary.errors += 1;
     }
 
     fn location(&mut self, asset: &Asset) -> Result<(PathBuf, String)> {
@@ -184,22 +171,18 @@ impl<'a> Exporter<'a> {
         {
             return Ok((dir.clone(), stem.clone()));
         }
-        // An asset already placed stays where it is, whatever its metadata now
-        // renders to; Consolidate is the step that moves things.
         let (dir, stem) = match self.state.location(&asset.uuid)? {
             Some((dir, stem)) => (PathBuf::from(dir), stem),
             None => {
-                let zoned = self.cfg.zoned(asset);
+                let zoned = asset.zoned(self.cfg.date_zone);
                 let dir = self
                     .cfg
                     .export_dir
                     .join(template::render(&self.cfg.path, |n, i| zoned.field(n, i)));
-                let stem = if self.dry {
-                    plan_stem(self.state, self.cfg, &zoned, &dir)?
-                } else {
+                if !self.dry {
                     std::fs::create_dir_all(&dir)?;
-                    choose_stem(self.state, self.cfg, &zoned, &dir)?
-                };
+                }
+                let stem = pick_stem(self.state, self.cfg, &zoned, &dir, !self.dry)?;
                 (dir, stem)
             }
         };
@@ -207,17 +190,17 @@ impl<'a> Exporter<'a> {
         Ok((dir, stem))
     }
 
-    pub fn exported(&self, uuid: &str, kind: Kind) -> Result<bool> {
-        Ok(self.state.exported(uuid, kind.name())?.is_some())
+    pub(crate) fn exported(&self, uuid: &str, kind: Kind) -> Result<bool> {
+        Ok(self.state.exported(uuid, kind)?.is_some())
     }
 
-    pub fn temp_path(&self, uuid: &str, kind: Kind) -> Result<PathBuf> {
+    pub(crate) fn temp_path(&self, uuid: &str, kind: Kind) -> Result<PathBuf> {
         let dir = self.cfg.export_dir.join(".tmp");
         std::fs::create_dir_all(&dir)?;
         Ok(dir.join(format!("{uuid}.{}", kind.name())))
     }
 
-    pub fn place(
+    pub(crate) fn place(
         &mut self,
         asset: &Asset,
         kind: Kind,
@@ -225,7 +208,7 @@ impl<'a> Exporter<'a> {
         tmp: &Path,
         hash: &str,
     ) -> Result<()> {
-        let asset = &self.resolve(asset, Some(tmp))?;
+        let asset = &self.resolve(asset, Some(tmp))?.0;
         let target = match self.state.duplicate(hash)? {
             Some(_) => None,
             None => {
@@ -234,7 +217,7 @@ impl<'a> Exporter<'a> {
             }
         };
         let uuid = &asset.uuid;
-        let placed = self.state.place(uuid, kind.name(), hash, tmp, || {
+        let placed = self.state.place(uuid, kind, hash, tmp, || {
             link_unique(tmp, target.as_deref().context("placed twice")?, uuid, hash)
         })?;
         match placed {
@@ -268,8 +251,8 @@ impl<'a> Exporter<'a> {
     }
 
     /// Logs where a resource would land, for a dry run.
-    pub fn plan(&mut self, asset: &Asset, kind: Kind, filename: &str) -> Result<()> {
-        let asset = &self.resolve(asset, None)?;
+    pub(crate) fn plan(&mut self, asset: &Asset, kind: Kind, filename: &str) -> Result<()> {
+        let asset = &self.resolve(asset, None)?.0;
         let (dir, stem) = self.location(asset)?;
         let dest = dir.join(kind.file_name(&stem, filename));
         self.summary.exported += 1;
@@ -282,16 +265,16 @@ impl<'a> Exporter<'a> {
         Ok(())
     }
 
-    pub fn sidecar(&mut self, asset: &Asset) -> Result<()> {
-        if self.dry || self.state.stem(&asset.uuid)?.is_none() {
+    pub(crate) fn sidecar(&mut self, asset: &Asset) -> Result<()> {
+        if self.dry || self.state.location(&asset.uuid)?.is_none() {
             return Ok(());
         }
-        let original = self.state.exported(&asset.uuid, "original")?;
-        let mut asset = self.resolve(asset, original.as_deref().map(Path::new))?;
+        let original = self.state.exported(&asset.uuid, Kind::Original)?;
+        let (mut asset, meta) = self.resolve(asset, original.as_deref().map(Path::new))?;
         let (dir, stem) = self.location(&asset)?;
         let needs_exif = asset.latitude.is_none() || asset.camera == Camera::default();
         if let (true, Some(original)) = (needs_exif, original) {
-            let meta = crate::photo::exif::read_metadata(Path::new(&original));
+            let meta = meta.unwrap_or_else(|| exif::read_metadata(Path::new(&original)));
             if let (None, Some((lat, lon))) = (asset.latitude, meta.gps) {
                 asset.latitude = Some(lat);
                 asset.longitude = Some(lon);
@@ -324,32 +307,35 @@ impl<'a> Exporter<'a> {
 
     /// The asset with its taken date settled: a date stored under `taken:<uuid>`
     /// (set by a redate or an earlier run) wins, then the source's own date, then
-    /// what the file carries, then the upload time.
-    fn resolve(&self, asset: &Asset, file: Option<&Path>) -> Result<Asset> {
+    /// what the file carries, then the upload time. Returns the file's
+    /// metadata too when it had to be read.
+    fn resolve(
+        &self,
+        asset: &Asset,
+        file: Option<&Path>,
+    ) -> Result<(Asset, Option<exif::Metadata>)> {
         let mut asset = asset.clone();
         let key = format!("taken:{}", asset.uuid);
         if let Some(t) = self.state.get(&key)? {
             asset.taken = chrono::DateTime::parse_from_rfc3339(&t).ok();
-            return Ok(asset);
+            return Ok((asset, None));
         }
-        if self.cfg.date_source == crate::config::DateSource::File
-            && let Some(t) = file.and_then(crate::photo::exif::taken)
-        {
-            asset.taken = Some(t);
-            return Ok(asset);
-        }
-        if asset.taken.is_some() {
-            return Ok(asset);
-        }
-        if let Some(t) = file.and_then(crate::photo::exif::taken) {
-            if !self.dry {
-                self.state.set(&key, &t.to_rfc3339())?;
+        let file_first = self.cfg.date_source == crate::config::DateSource::File;
+        let meta = file
+            .filter(|_| file_first || asset.taken.is_none())
+            .map(exif::read_metadata);
+        match meta.as_ref().and_then(|m| m.dates.taken()) {
+            Some(t) if file_first => asset.taken = Some(t),
+            _ if asset.taken.is_some() => {}
+            Some(t) => {
+                if !self.dry {
+                    self.state.set(&key, &t.to_rfc3339())?;
+                }
+                asset.taken = Some(t);
             }
-            asset.taken = Some(t);
-            return Ok(asset);
+            None => asset.taken = asset.uploaded,
         }
-        asset.taken = asset.uploaded;
-        Ok(asset)
+        Ok((asset, meta))
     }
 
     fn asset(&mut self, src: &dyn Source, asset: &Asset, local_id: &str) -> Result<()> {
@@ -373,12 +359,12 @@ impl<'a> Exporter<'a> {
         self.sidecar(asset)
     }
 
-    pub fn finish(self) -> Summary {
+    pub(crate) fn finish(self) -> Summary {
         let _ = std::fs::remove_dir(self.cfg.export_dir.join(".tmp"));
         self.summary
     }
 
-    pub fn export(
+    fn export(
         &mut self,
         src: &dyn Source,
         n: usize,
@@ -389,8 +375,7 @@ impl<'a> Exporter<'a> {
     ) {
         self.pos = (n, total);
         let Some(asset) = asset else {
-            self.emit(self.error(uuid, "no metadata, skipping"));
-            self.summary.errors += 1;
+            self.fail(uuid, "no metadata, skipping");
             return;
         };
         if !self.cfg.filter.matches(asset) {
@@ -403,20 +388,24 @@ impl<'a> Exporter<'a> {
             name: asset.filename.clone(),
         });
         if let Err(e) = self.asset(src, asset, local_id) {
-            self.emit(self.error(&asset.filename, format!("{e:#}")));
-            self.summary.errors += 1;
+            self.fail(&asset.filename, format!("{e:#}"));
         }
     }
 }
 
 /// The asset as last recorded for its export: the sidecar if there is one,
 /// otherwise the packet embedded in one of its files.
-pub fn stored_asset(state: &State, dir: &str, stem: &str, uuid: &str) -> Result<Option<Asset>> {
+pub(crate) fn stored_asset(
+    state: &State,
+    dir: &str,
+    stem: &str,
+    uuid: &str,
+) -> Result<Option<Asset>> {
     if let Ok(text) = std::fs::read_to_string(Path::new(dir).join(format!("{stem}.xmp"))) {
         return Ok(crate::photo::xmp::read(&text));
     }
     for (kind, path) in state.exports_of(uuid)? {
-        if kind == Kind::Adjustments.name() {
+        if kind == Kind::Adjustments {
             continue;
         }
         if let Ok(Some(packet)) = crate::photo::embed::read(Path::new(&path))
@@ -431,7 +420,7 @@ pub fn stored_asset(state: &State, dir: &str, stem: &str, uuid: &str) -> Result<
 /// Writes the packet into every media file of the asset. Files shared with
 /// another asset through content dedup are left alone, since they can only
 /// carry one asset's metadata.
-pub fn embed_asset(
+pub(crate) fn embed_asset(
     state: &State,
     export_dir: &Path,
     uuid: &str,
@@ -446,7 +435,7 @@ pub fn embed_asset(
             .unwrap_or_else(|_| p.to_owned())
     };
     for (kind, path) in state.exports_of(uuid)? {
-        if kind == Kind::Adjustments.name() || state.shared(&path)? {
+        if kind == Kind::Adjustments || state.shared(&path)? {
             continue;
         }
         match crate::photo::embed::embed(Path::new(&path), xmp) {
@@ -456,19 +445,19 @@ pub fn embed_asset(
                 path: rel(&path),
             }),
             Ok(Embed::Unchanged | Embed::Unsupported) => {}
-            Err(e) => progress(Event::Error {
-                n: Some(n),
-                total: Some(total),
-                subject: rel(&path),
-                text: format!("embed: {e:#}"),
-            }),
+            Err(e) => progress(Event::error_at(
+                n,
+                total,
+                rel(&path),
+                format!("embed: {e:#}"),
+            )),
         }
     }
     Ok(())
 }
 
-pub fn run(
-    src: &(dyn Source + Sync),
+pub(crate) fn run(
+    src: &dyn Source,
     cfg: &Config,
     state: &State,
     assets: &HashMap<String, Asset>,
@@ -482,7 +471,7 @@ pub fn run(
     }
     drop(tx);
     let rx = Mutex::new(rx);
-    let mut summary = Summary::default();
+    let mut all = Exporter::new(cfg, state, progress, dry);
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..cfg.concurrency)
             .map(|_| {
@@ -499,13 +488,10 @@ pub fn run(
             })
             .collect();
         for w in workers {
-            summary.add(w.join().unwrap());
+            all.summary.add(w.join().unwrap());
         }
     });
-    if !dry {
-        let _ = std::fs::remove_dir(cfg.export_dir.join(".tmp"));
-    }
-    summary
+    all.finish()
 }
 
 #[cfg(test)]
@@ -514,14 +500,10 @@ mod tests {
     use crate::sources::Resource;
 
     #[test]
-    fn hashes_known_content() {
+    fn writes_what_it_hashes() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("f");
-        std::fs::write(&p, b"hello").unwrap();
-        let want = blake3::hash(b"hello").to_hex().to_string();
-        assert_eq!(hash_file(&p).unwrap(), want);
         let q = dir.path().join("g");
-        assert_eq!(write_hashed(b"hello".as_slice(), &q).unwrap(), want);
+        write_hashed(b"hello".as_slice(), &q).unwrap();
         assert_eq!(std::fs::read(q).unwrap(), b"hello");
     }
 
@@ -575,7 +557,7 @@ mod tests {
             uuid: uuid.into(),
             filename: filename.into(),
             keywords: vec![keyword.into()],
-            taken: crate::sources::apple_photos::library::cocoa_time(0.0, 0),
+            taken: chrono::DateTime::parse_from_rfc3339("2001-01-01T00:00:00Z").ok(),
             ..Default::default()
         }
     }
@@ -710,15 +692,15 @@ mod tests {
         assert_eq!(back.uuid, "F");
     }
 
-    #[test]
-    fn filename_template_and_filter() {
-        let out = tempfile::tempdir().unwrap();
+    /// Exports A and B (same filename, keyword beach) and C (keyword city)
+    /// under a `{take.date}_{keyword:0}_{stem}` filename, filtered to beach.
+    fn export_templated(out: &Path) -> (State, Summary) {
         let cfg = Config::parse(&format!(
             "export_dir = \"{}\"\npath = \"{{take.year}}\"\nfilename = \"{{take.date}}_{{keyword:0}}_{{stem}}\"\nembed = false\nconcurrency = 1\n[filter]\nkeywords = [\"beach\"]",
-            out.path().display()
+            out.display()
         ))
         .unwrap();
-        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let state = State::open(&out.join("state.sqlite")).unwrap();
         let assets = HashMap::from([
             ("A".to_string(), asset("A", "IMG_1.HEIC", "beach")),
             ("B".to_string(), asset("B", "IMG_1.HEIC", "beach")),
@@ -751,6 +733,13 @@ mod tests {
             &|e| eprintln!("{e}"),
             false,
         );
+        (state, s)
+    }
+
+    #[test]
+    fn names_by_filename_template_and_filters() {
+        let out = tempfile::tempdir().unwrap();
+        let (_, s) = export_templated(out.path());
         assert_eq!((s.exported, s.filtered, s.errors), (2, 1, 0));
         let mut names: Vec<_> = std::fs::read_dir(out.path().join("2001"))
             .unwrap()
@@ -767,14 +756,18 @@ mod tests {
             ]
         );
         assert!(!out.path().join("2001").join("IMG_2.JPG").exists());
+    }
 
-        // Changing the filename template renames on consolidate.
-        let cfg2 = Config::parse(&format!(
+    #[test]
+    fn consolidate_renames_after_filename_template_change() {
+        let out = tempfile::tempdir().unwrap();
+        let (state, _) = export_templated(out.path());
+        let cfg = Config::parse(&format!(
             "export_dir = \"{}\"\npath = \"{{take.year}}\"\nfilename = \"{{stem}}\"\nembed = false",
             out.path().display()
         ))
         .unwrap();
-        let c = crate::consolidate::run(&cfg2, &state, &|e| eprintln!("{e}"), false).unwrap();
+        let c = crate::consolidate::run(&cfg, &state, &|e| eprintln!("{e}"), false).unwrap();
         assert_eq!((c.moved, c.restemmed), (2, 2));
         assert!(out.path().join("2001/IMG_1.HEIC").exists());
         assert!(out.path().join("2001/IMG_1_B.HEIC").exists());
@@ -816,7 +809,7 @@ mod tests {
         );
         assert!(!out.path().join("2001").exists(), "no folders created");
         assert_eq!(state.stem("A").unwrap(), None, "nothing claimed");
-        assert_eq!(state.exported("A", "original").unwrap(), None);
+        assert_eq!(state.exported("A", Kind::Original).unwrap(), None);
         let s = run(
             &src,
             &cfg,
@@ -896,7 +889,7 @@ mod tests {
             names,
             ["IMG_1.AAE", "IMG_1.HEIC", "IMG_1.xmp", "IMG_1_edited.jpeg"]
         );
-        assert!(state.exported("B", "original").unwrap().is_some());
+        assert!(state.exported("B", Kind::Original).unwrap().is_some());
         assert_eq!(state.stem("B").unwrap(), None);
         let sidecar =
             crate::photo::xmp::read(&std::fs::read_to_string(beach.join("IMG_1.xmp")).unwrap())

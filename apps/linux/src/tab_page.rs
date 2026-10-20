@@ -1,18 +1,25 @@
+use crate::copy;
 use crate::dates_view::DatesPanel;
 use crate::status_view::StatusView;
 use crate::ui::{self, Toaster, hbox, vbox};
 use adw::prelude::*;
 use gtk::gio;
-use photosink_bridge::catalog::{ArgSpec, PickerKind, RunArgs, Tab, TabInfo};
-use photosink_bridge::{Core, CoreError};
+use photosink_bridge::Core;
+use photosink_bridge::catalog::{RunArgs, Tab};
 use std::rc::Rc;
 use std::sync::Arc;
+
+#[derive(Clone, Copy)]
+enum Pick {
+    Folder,
+    Archive(&'static [&'static str]),
+}
 
 /// One tab: its argument group over its rows, and its header-bar controls.
 pub struct TabPage {
     core: Arc<Core>,
     toaster: Toaster,
-    pub info: TabInfo,
+    pub tab: Tab,
     pub content: gtk::Box,
     pub header: gtk::Widget,
     run: gtk::Button,
@@ -21,33 +28,41 @@ pub struct TabPage {
     pub dates: Option<Rc<DatesPanel>>,
 }
 
-impl TabPage {
-    fn tab(&self) -> Tab {
-        self.info.tab
-    }
+fn arg_row(tab: Tab, placeholder: &str) -> adw::EntryRow {
+    let row = adw::EntryRow::builder()
+        .title(copy::arg_label(tab))
+        .use_markup(false)
+        .build();
+    ui::row_placeholder(&row, placeholder);
+    row
+}
 
+impl TabPage {
     fn update_args(&self, f: impl FnOnce(&mut RunArgs)) {
-        let mut args = self.core.run_args(self.tab());
+        let mut args = self.core.run_args(self.tab);
         f(&mut args);
-        self.core.set_run_args(self.tab(), args);
+        self.core.set_run_args(self.tab, args);
         self.refresh_run();
     }
 
     fn start(&self) {
-        if let Err(CoreError::Failed(e)) = self.core.start(self.tab()) {
-            self.toaster.show(e);
+        if let Err(e) = self.core.start(self.tab) {
+            self.toaster.show(copy::error(self.tab, &e));
         }
     }
 
     fn run(self: &Rc<Self>) {
-        if self.core.blocker(self.tab()).is_some() {
+        if self.core.blocker(self.tab).is_some() {
             return;
         }
-        let Some(c) = self.core.confirmation(self.tab()) else {
+        let Some(c) = self.core.confirmation(self.tab) else {
             return self.start();
         };
-        let dialog = adw::AlertDialog::new(Some(&c.title), Some(&c.message));
-        dialog.add_responses(&[("cancel", "Cancel"), ("ok", &c.ok)]);
+        let dialog = adw::AlertDialog::new(
+            Some(copy::CONFIRM_CLEAN_TITLE),
+            Some(copy::confirmation_message(&c)),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("ok", copy::CONFIRM_CLEAN_OK)]);
         dialog.set_response_appearance("ok", adw::ResponseAppearance::Destructive);
         dialog.set_default_response(Some("cancel"));
         dialog.set_close_response("cancel");
@@ -62,23 +77,22 @@ impl TabPage {
         dialog.present(Some(&self.content));
     }
 
-    fn pick(self: &Rc<Self>, spec: &ArgSpec, folder: bool) {
+    fn pick(self: &Rc<Self>, pick: Pick) {
         let dialog = gtk::FileDialog::new();
         dialog.set_modal(true);
-        let current = self.core.run_args(self.tab()).arg;
+        let current = self.core.run_args(self.tab).arg;
         let current = current.trim();
         if !current.is_empty() {
             let file = gio::File::for_path(current);
-            if folder {
-                dialog.set_initial_folder(Some(&file));
-            } else {
-                dialog.set_initial_file(Some(&file));
+            match pick {
+                Pick::Folder => dialog.set_initial_folder(Some(&file)),
+                Pick::Archive(_) => dialog.set_initial_file(Some(&file)),
             }
         }
-        if !folder && !spec.extensions.is_empty() {
+        if let Pick::Archive(extensions) = pick {
             let filter = gtk::FileFilter::new();
-            filter.set_name(Some(&spec.label));
-            for ext in &spec.extensions {
+            filter.set_name(Some(copy::arg_label(self.tab)));
+            for ext in extensions {
                 filter.add_suffix(ext);
             }
             let filters = gio::ListStore::new::<gtk::FileFilter>();
@@ -97,94 +111,112 @@ impl TabPage {
             row.set_text(&path.display().to_string());
         };
         let parent = ui::window_of(&self.content);
-        if folder {
-            dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, done);
-        } else {
-            dialog.open(parent.as_ref(), gio::Cancellable::NONE, done);
+        match pick {
+            Pick::Folder => dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, done),
+            Pick::Archive(_) => dialog.open(parent.as_ref(), gio::Cancellable::NONE, done),
         }
     }
 
-    fn picker_button(
-        self: &Rc<Self>,
-        spec: &ArgSpec,
-        folder: bool,
-        icon: &str,
-        tip: &str,
-    ) -> gtk::Button {
+    fn add_picker(self: &Rc<Self>, row: &adw::EntryRow, pick: Pick, icon: &str, tip: &str) {
         let b = gtk::Button::from_icon_name(icon);
         b.set_tooltip_text(Some(tip));
         b.set_valign(gtk::Align::Center);
         b.add_css_class("flat");
-        let (weak, spec) = (Rc::downgrade(self), spec.clone());
+        let weak = Rc::downgrade(self);
         b.connect_clicked(move |_| {
             if let Some(page) = weak.upgrade() {
-                page.pick(&spec, folder);
+                page.pick(pick);
             }
         });
-        b
+        row.add_suffix(&b);
     }
 
-    fn connect(self: &Rc<Self>, group: &adw::PreferencesGroup) {
-        let tab = self.tab();
-        let args = self.core.run_args(tab);
-        if let (Some(spec), Some(row)) = (&self.info.arg, &self.arg) {
-            row.set_text(&args.arg);
+    fn connect_arg(self: &Rc<Self>, group: &adw::PreferencesGroup, run_on_enter: bool) {
+        let Some(row) = &self.arg else { return };
+        row.set_text(&self.core.run_args(self.tab).arg);
+        let weak = Rc::downgrade(self);
+        row.connect_changed(move |r| {
+            if let Some(page) = weak.upgrade() {
+                let text = r.text().to_string();
+                page.update_args(|a| a.arg = text);
+            }
+        });
+        if run_on_enter {
             let weak = Rc::downgrade(self);
-            row.connect_changed(move |r| {
+            row.connect_entry_activated(move |_| {
                 if let Some(page) = weak.upgrade() {
-                    let text = r.text().to_string();
-                    page.update_args(|a| a.arg = text);
+                    page.run();
                 }
             });
-            if spec.run_on_enter {
-                let weak = Rc::downgrade(self);
-                row.connect_entry_activated(move |_| {
-                    if let Some(page) = weak.upgrade() {
-                        page.run();
-                    }
-                });
+        }
+        group.add(row);
+    }
+
+    fn add_switch(
+        self: &Rc<Self>,
+        group: &adw::PreferencesGroup,
+        title: &str,
+        active: bool,
+        set: fn(&mut RunArgs, bool),
+    ) {
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .use_markup(false)
+            .active(active)
+            .build();
+        let weak = Rc::downgrade(self);
+        row.connect_active_notify(move |r| {
+            if let Some(page) = weak.upgrade() {
+                let on = r.is_active();
+                page.update_args(|a| set(a, on));
             }
-            match spec.picker {
-                PickerKind::None => {}
-                PickerKind::Library => {
-                    row.add_suffix(&self.picker_button(
-                        spec,
-                        true,
-                        "folder-open-symbolic",
-                        "Choose…",
-                    ));
+        });
+        group.add(&row);
+    }
+
+    fn add_dry_run(self: &Rc<Self>, group: &adw::PreferencesGroup) {
+        let dry = self.core.run_args(self.tab).dry;
+        self.add_switch(group, "Dry run", dry, |a, on| a.dry = on);
+    }
+
+    fn build(self: &Rc<Self>, group: &adw::PreferencesGroup) {
+        match self.tab {
+            Tab::ApplePhotos => {
+                if let Some(row) = &self.arg {
+                    self.add_picker(row, Pick::Folder, "folder-open-symbolic", "Choose…");
                 }
-                PickerKind::FolderOrArchive => {
-                    row.add_suffix(&self.picker_button(
-                        spec,
-                        true,
-                        "folder-open-symbolic",
-                        "Choose folder…",
-                    ));
-                    row.add_suffix(&self.picker_button(
-                        spec,
-                        false,
+                self.connect_arg(group, false);
+                self.add_dry_run(group);
+            }
+            Tab::OneDrive | Tab::Dropbox => {
+                self.connect_arg(group, false);
+                self.add_dry_run(group);
+            }
+            Tab::GoogleTakeout => {
+                if let Some(row) = &self.arg {
+                    self.add_picker(row, Pick::Folder, "folder-open-symbolic", "Choose folder…");
+                    self.add_picker(
+                        row,
+                        Pick::Archive(&["zip", "tgz", "gz"]),
                         "package-x-generic-symbolic",
                         "Choose archive…",
-                    ));
+                    );
                 }
+                self.connect_arg(group, false);
+                self.add_dry_run(group);
             }
-            group.add(row);
-        }
-        if let Some(text) = &self.info.option {
-            let row = adw::SwitchRow::builder()
-                .title(text)
-                .use_markup(false)
-                .active(args.option)
-                .build();
-            let weak = Rc::downgrade(self);
-            row.connect_active_notify(move |r| {
-                if let Some(page) = weak.upgrade() {
-                    let on = r.is_active();
-                    page.update_args(|a| a.option = on);
-                }
-            });
-            group.add(&row);
+            Tab::Consolidate => self.add_dry_run(group),
+            Tab::Clean => {
+                let option = self.core.run_args(self.tab).option;
+                self.add_switch(
+                    group,
+                    "Also delete files the state doesn't reference",
+                    option,
+                    |a, on| a.option = on,
+                );
+                self.add_dry_run(group);
+            }
+            Tab::Dates => self.connect_arg(group, true),
         }
         let weak = Rc::downgrade(self);
         self.run.connect_clicked(move |_| {
@@ -194,57 +226,61 @@ impl TabPage {
         });
     }
 
-    pub fn new(core: Arc<Core>, info: TabInfo, toaster: Toaster) -> Rc<TabPage> {
-        let tab = info.tab;
-        let args = core.run_args(tab);
+    pub fn new(core: Arc<Core>, tab: Tab, toaster: Toaster) -> Rc<TabPage> {
         let view = StatusView::new(core.clone(), tab, toaster.clone());
 
-        let run = gtk::Button::with_label(&core.run_label(tab));
+        let run = gtk::Button::with_label(copy::run_label(tab, &core.run_args(tab)));
         run.add_css_class("suggested-action");
         let normal = hbox(6);
         normal.append(&view.clear);
         normal.append(&view.follow);
         normal.append(&view.filter);
-        let dry = info.dry_run.then(|| {
-            let dry = gtk::ToggleButton::with_label("Dry run");
-            dry.set_active(args.dry);
-            normal.append(&dry);
-            dry
-        });
         normal.append(&run);
 
         let group = adw::PreferencesGroup::new();
-        group.set_description(Some(&info.hint));
+        group.set_description(Some(copy::hint(tab)));
         group.set_margin_start(12);
         group.set_margin_end(12);
         group.set_margin_top(12);
         group.set_margin_bottom(12);
-        let arg = info.arg.as_ref().map(|spec| {
-            let row = adw::EntryRow::builder()
-                .title(&spec.label)
-                .use_markup(false)
-                .build();
-            ui::row_placeholder(&row, &spec.placeholder);
-            row
-        });
+        let arg = match tab {
+            Tab::ApplePhotos => Some(arg_row(tab, "Photos library")),
+            Tab::OneDrive => Some(arg_row(
+                tab,
+                "Folder under the drive root; empty for the whole drive",
+            )),
+            Tab::Dropbox => Some(arg_row(tab, "Folder in your Dropbox; empty for everything")),
+            Tab::GoogleTakeout => Some(arg_row(
+                tab,
+                "Folder of archives, a single archive, or an extracted tree",
+            )),
+            Tab::Dates => Some(arg_row(
+                tab,
+                "Leave empty to list only assets whose date disagrees with the file",
+            )),
+            Tab::Consolidate | Tab::Clean => None,
+        };
 
         let content = vbox(0);
         content.append(&group);
         content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        let (dates, header): (Option<Rc<DatesPanel>>, gtk::Widget) = if tab == Tab::Dates {
-            let panel = DatesPanel::new(core.clone(), &view, &normal, toaster.clone());
-            content.append(&panel.root);
-            let header = panel.header.clone().upcast();
-            (Some(panel), header)
-        } else {
-            content.append(&view.root);
-            (None, normal.upcast())
+        let (dates, header): (Option<Rc<DatesPanel>>, gtk::Widget) = match tab {
+            Tab::Dates => {
+                let panel = DatesPanel::new(core.clone(), &view, &normal, toaster.clone());
+                content.append(&panel.root);
+                let header = panel.header.clone().upcast();
+                (Some(panel), header)
+            }
+            _ => {
+                content.append(&view.root);
+                (None, normal.upcast())
+            }
         };
 
         let page = Rc::new(TabPage {
             core,
             toaster,
-            info,
+            tab,
             content,
             header,
             run,
@@ -252,24 +288,16 @@ impl TabPage {
             view,
             dates,
         });
-        page.connect(&group);
-        if let Some(dry) = dry {
-            let weak = Rc::downgrade(&page);
-            dry.connect_toggled(move |b| {
-                if let Some(page) = weak.upgrade() {
-                    let on = b.is_active();
-                    page.update_args(|a| a.dry = on);
-                }
-            });
-        }
+        page.build(&group);
         page
     }
 
     pub fn refresh_run(&self) {
-        let tab = self.tab();
-        self.run.set_label(&self.core.run_label(tab));
-        let blocker = self.core.blocker(tab);
+        self.run
+            .set_label(copy::run_label(self.tab, &self.core.run_args(self.tab)));
+        let blocker = self.core.blocker(self.tab);
         self.run.set_sensitive(blocker.is_none());
-        self.run.set_tooltip_text(blocker.as_deref());
+        self.run
+            .set_tooltip_text(blocker.map(|b| copy::blocker(self.tab, &b)).as_deref());
     }
 }

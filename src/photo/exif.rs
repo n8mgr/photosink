@@ -6,12 +6,10 @@ use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 fn head(file: &mut BufReader<File>) -> Vec<u8> {
-    let mut head = vec![0u8; 4 << 20];
-    let n = file
-        .rewind()
-        .and_then(|_| file.read(&mut head))
-        .unwrap_or(0);
-    head.truncate(n);
+    let mut head = Vec::new();
+    if file.rewind().is_err() || file.take(4 << 20).read_to_end(&mut head).is_err() {
+        head.clear();
+    }
     head
 }
 
@@ -108,8 +106,11 @@ fn local(naive: NaiveDateTime) -> Option<DateTime<FixedOffset>> {
 pub struct Metadata {
     pub gps: Option<(f64, f64)>,
     pub camera: Camera,
+    pub dates: Dates,
 }
 
+/// EXIF DateTimeOriginal, DateTimeDigitized and ModifyDate; for a video
+/// container without EXIF, the `mvhd` creation time as `create`.
 #[derive(Debug, Default, PartialEq)]
 pub struct Dates {
     pub original: Option<NaiveDateTime>,
@@ -117,31 +118,29 @@ pub struct Dates {
     pub modify: Option<NaiveDateTime>,
 }
 
-/// EXIF DateTimeOriginal, DateTimeDigitized and ModifyDate; for a video
-/// container without EXIF, the `mvhd` creation time as `create`.
-pub fn dates(path: &Path) -> Dates {
+impl Dates {
+    /// The best taken date the file offers, in the local zone.
+    pub fn taken(&self) -> Option<DateTime<FixedOffset>> {
+        self.original
+            .or(self.create)
+            .or(self.modify)
+            .and_then(local)
+    }
+}
+
+/// GPS, camera and dates from one parse of the file's EXIF.
+pub fn read_metadata(path: &Path) -> Metadata {
     let exifs = read(path);
-    let mut d = Dates {
+    let tiff_or_exif = [Context::Tiff, Context::Exif];
+    let mut dates = Dates {
         original: date(&exifs, 0x9003),
         create: date(&exifs, 0x9004),
         modify: date(&exifs, 0x0132),
     };
-    if d == Dates::default() {
-        d.create =
+    if dates == Dates::default() {
+        dates.create =
             crate::photo::embed::creation_time(path).map(|t| t.with_timezone(&Local).naive_local());
     }
-    d
-}
-
-/// The best taken date the file itself offers, in the local zone.
-pub fn taken(path: &Path) -> Option<DateTime<FixedOffset>> {
-    let d = dates(path);
-    d.original.or(d.create).or(d.modify).and_then(local)
-}
-
-pub fn read_metadata(path: &Path) -> Metadata {
-    let exifs = read(path);
-    let tiff_or_exif = [Context::Tiff, Context::Exif];
     Metadata {
         gps: coordinate(&exifs, 2, 1).zip(coordinate(&exifs, 4, 3)),
         camera: Camera {
@@ -149,6 +148,7 @@ pub fn read_metadata(path: &Path) -> Metadata {
             model: text(&exifs, 0x0110, &tiff_or_exif),
             lens: text(&exifs, 0xa434, &tiff_or_exif),
         },
+        dates,
     }
 }
 

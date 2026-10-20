@@ -9,7 +9,7 @@ native app per platform over one Rust core.
 | Path | What |
 |---|---|
 | `src/` | `photosink` crate: sources, export, state DB, EXIF/XMP writers, consolidate, clean, redate. Emits typed `Event`s through a `Progress` callback. |
-| `bridge/` | `photosink-bridge`: the window model every app renders, exported with UniFFI 0.31. Settings, tab catalogue, runs, the status grid (grouping, states, filters) and the Dates picker. |
+| `bridge/` | `photosink-bridge`: typed window state shared by the apps, exported with UniFFI 0.31. Settings, runs, the status grid (grouping, states, filters) and the Dates picker. No user-facing text. |
 | `apps/macos/` | SwiftUI app (SwiftPM, macOS 26). `build.sh` builds the bridge, generates Swift bindings and assembles `build/Photosink.app`. |
 | `apps/linux/` | GTK 4 + libadwaita app; its own Cargo workspace using `bridge` as a crate. |
 | `apps/windows/` | WinUI 3 app (C#, .NET 10). `build.ps1` builds the bridge, runs `uniffi-bindgen-cs` and the .NET build. |
@@ -17,10 +17,12 @@ native app per platform over one Rust core.
 
 ## Rules
 
-- **Logic lives in Rust.** Anything more than presentation (labels, validation, summaries,
-  row grouping, filter state, run labels, confirmations) belongs in `bridge`, so the three
-  apps stay thin and say the same thing. If an app needs something Core doesn't expose,
-  add it to `bridge` rather than computing it in Swift, Rust-GTK or C#.
+- **Logic in Rust, presentation in the apps.** Behaviour (runs, validation, row grouping,
+  filter state, date choices) belongs in `bridge` and is exposed as typed data: enums,
+  counts, timestamps, paths, structured facts. Every user-facing string, glyph, label,
+  summary and number or date format belongs to the app, so each platform presents things
+  its own way. Tabs are a closed `Tab` enum; each app builds each tab's UI explicitly
+  rather than rendering a generic description from the bridge.
 - **Native structure, stock controls.** Each app uses its platform's own window structure:
   macOS sidebar + toolbar + window subtitle + Settings scene; GNOME NavigationSplitView +
   HeaderBar + PreferencesDialog; Windows NavigationView + CommandBar + Settings page. No
@@ -43,7 +45,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check                    # licenses (GPL-3.0 compatible), advisories, sources
 
-# Linux app (needs libgtk-4-dev and libadwaita-1-dev on Linux, or brew gtk4 libadwaita)
+# Linux app (needs libgtk-4-dev and libadwaita-1-dev on Linux, or brew gtk4 libadwaita adwaita-icon-theme)
 cargo clippy --manifest-path apps/linux/Cargo.toml --all-targets -- -D warnings
 
 # macOS app (Xcode 26+)

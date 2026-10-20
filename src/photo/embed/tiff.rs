@@ -123,13 +123,15 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
 
 pub fn embed(path: &Path, xmp: &str) -> Result<bool> {
     let mut f = OpenOptions::new().read(true).write(true).open(path)?;
+    let ifd = Ifd0::read(&mut f)?;
+    let tag = ifd.xmp();
     let Ifd0 {
         bo,
         mut entries,
         next,
         ..
-    } = Ifd0::read(&mut f)?;
-    if let Some((i, pos, n)) = Ifd0::read(&mut f)?.xmp() {
+    } = ifd;
+    if let Some((i, pos, n)) = tag {
         let existing = read_at(&mut f, pos, n)?;
         if same(&existing, xmp) {
             return Ok(false);

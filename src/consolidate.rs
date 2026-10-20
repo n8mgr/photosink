@@ -5,12 +5,20 @@ use crate::{Event, Progress};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
-#[derive(Default, Debug, Clone, serde::Serialize)]
+#[derive(Default, Debug, Clone)]
 pub struct Consolidated {
     pub moved: usize,
     pub restemmed: usize,
     pub unchanged: usize,
     pub missing: usize,
+}
+
+struct Pass<'a> {
+    cfg: &'a Config,
+    state: &'a State,
+    progress: Progress<'a>,
+    dry: bool,
+    out: Consolidated,
 }
 
 fn move_file(from: &Path, to: &Path) -> Result<()> {
@@ -25,6 +33,16 @@ fn restem(name: &str, old: &str, new: &str) -> String {
     match name.strip_prefix(old) {
         Some(rest) if rest.is_empty() || rest.starts_with(['.', '_']) => format!("{new}{rest}"),
         _ => name.to_owned(),
+    }
+}
+
+fn pass<'a>(cfg: &'a Config, state: &'a State, progress: Progress<'a>, dry: bool) -> Pass<'a> {
+    Pass {
+        cfg,
+        state,
+        progress,
+        dry,
+        out: Consolidated::default(),
     }
 }
 
@@ -82,114 +100,83 @@ fn relocate(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn one(
-    cfg: &Config,
-    state: &State,
-    uuid: &str,
-    dir: &str,
-    stem: &str,
-    (n, total): (usize, usize),
-    progress: Progress,
-    out: &mut Consolidated,
-    dry: bool,
-) -> Result<()> {
-    let Some(asset) = crate::export::stored_asset(state, dir, stem, uuid)? else {
-        out.missing += 1;
-        progress(Event::Error {
-            n: Some(n),
-            total: Some(total),
-            subject: stem.to_owned(),
-            text: "no metadata, left as is".into(),
-        });
-        return Ok(());
-    };
-    let dir = PathBuf::from(dir);
-    let zoned = cfg.zoned(&asset);
-    let new_dir = cfg
-        .export_dir
-        .join(template::render(&cfg.path, |k, i| zoned.field(k, i)));
-    let wanted = crate::export::file_stem(cfg, &zoned);
-    let new_stem = free_stem(state, uuid, &new_dir.to_string_lossy(), &wanted)
-        .with_context(|| format!("{uuid} {stem}"))?;
-    if new_dir == dir && new_stem == stem {
-        out.unchanged += 1;
-        return Ok(());
-    }
-    let restemmed = new_stem != stem;
-    if !dry {
-        relocate(state, uuid, &dir, stem, &new_dir, &new_stem)
+impl Pass<'_> {
+    /// Moves asset `n` of `total`, `uuid` now at `dir`/`stem`.
+    fn one(&mut self, (n, total): (usize, usize), uuid: &str, dir: &str, stem: &str) -> Result<()> {
+        let (cfg, state) = (self.cfg, self.state);
+        let Some(asset) = crate::export::stored_asset(state, dir, stem, uuid)? else {
+            self.out.missing += 1;
+            (self.progress)(Event::error_at(n, total, stem, "no metadata, left as is"));
+            return Ok(());
+        };
+        let dir = PathBuf::from(dir);
+        let zoned = asset.zoned(cfg.date_zone);
+        let new_dir = cfg
+            .export_dir
+            .join(template::render(&cfg.path, |k, i| zoned.field(k, i)));
+        let wanted = crate::export::file_stem(&cfg.filename, &zoned);
+        let new_stem = free_stem(state, uuid, &new_dir.to_string_lossy(), &wanted)
             .with_context(|| format!("{uuid} {stem}"))?;
-        prune(dir, &cfg.export_dir);
+        if new_dir == dir && new_stem == stem {
+            self.out.unchanged += 1;
+            return Ok(());
+        }
+        let restemmed = new_stem != stem;
+        if !self.dry {
+            relocate(state, uuid, &dir, stem, &new_dir, &new_stem)
+                .with_context(|| format!("{uuid} {stem}"))?;
+            prune(dir, &cfg.export_dir);
+        }
+        self.out.moved += 1;
+        self.out.restemmed += restemmed as usize;
+        (self.progress)(Event::Moved {
+            n,
+            total,
+            stem: stem.to_owned(),
+            dest: format!(
+                "{}/{new_stem}",
+                new_dir
+                    .strip_prefix(&cfg.export_dir)
+                    .unwrap_or(&new_dir)
+                    .display()
+            ),
+        });
+        Ok(())
     }
-    out.moved += 1;
-    out.restemmed += restemmed as usize;
-    progress(Event::Moved {
-        n,
-        total,
-        stem: stem.to_owned(),
-        dest: format!(
-            "{}/{new_stem}",
-            new_dir
-                .strip_prefix(&cfg.export_dir)
-                .unwrap_or(&new_dir)
-                .display()
-        ),
-    });
-    Ok(())
+
+    fn all<'b>(
+        mut self,
+        assets: impl Iterator<Item = (usize, &'b (String, String, String))>,
+        total: usize,
+    ) -> Result<Consolidated> {
+        for (n, (uuid, dir, stem)) in assets {
+            self.one((n, total), uuid, dir, stem)?;
+        }
+        Ok(self.out)
+    }
 }
 
 pub fn run(cfg: &Config, state: &State, progress: Progress, dry: bool) -> Result<Consolidated> {
-    let mut out = Consolidated::default();
     let assets = state.assets_under(&cfg.export_dir.to_string_lossy())?;
-    let total = assets.len();
     progress(Event::Found {
-        total,
+        total: assets.len(),
         place: cfg.export_dir.display().to_string(),
     });
-    for (n, (uuid, dir, stem)) in assets.into_iter().enumerate() {
-        one(
-            cfg,
-            state,
-            &uuid,
-            &dir,
-            &stem,
-            (n + 1, total),
-            progress,
-            &mut out,
-            dry,
-        )?;
-    }
-    Ok(out)
+    let numbered = assets.iter().enumerate().map(|(i, a)| (i + 1, a));
+    pass(cfg, state, progress, dry).all(numbered, assets.len())
 }
 
-/// Consolidates just the given assets.
+/// Consolidates just the given `(uuid, dir, stem)` assets, each numbered
+/// `n` of `total` as the caller numbered it.
 pub fn assets(
     cfg: &Config,
     state: &State,
-    uuids: &[String],
+    assets: &[(usize, (String, String, String))],
+    total: usize,
     progress: Progress,
 ) -> Result<Consolidated> {
-    let mut out = Consolidated::default();
-    let total = uuids.len();
-    for (n, uuid) in uuids.iter().enumerate() {
-        let Some((dir, stem)) = state.location(uuid)? else {
-            out.missing += 1;
-            continue;
-        };
-        one(
-            cfg,
-            state,
-            uuid,
-            &dir,
-            &stem,
-            (n + 1, total),
-            progress,
-            &mut out,
-            false,
-        )?;
-    }
-    Ok(out)
+    let numbered = assets.iter().map(|(n, a)| (*n, a));
+    pass(cfg, state, progress, false).all(numbered, total)
 }
 
 #[cfg(test)]
@@ -219,9 +206,9 @@ mod tests {
         for f in files {
             std::fs::write(dir.join(f), f).unwrap();
             let kind = if f.contains("_edited") {
-                "edited"
+                crate::sources::Kind::Edited
             } else {
-                "original"
+                crate::sources::Kind::Original
             };
             state
                 .record(
@@ -243,7 +230,7 @@ mod tests {
         Asset {
             uuid: uuid.into(),
             filename: filename.into(),
-            taken: crate::sources::apple_photos::library::cocoa_time(0.0, 0),
+            taken: chrono::DateTime::parse_from_rfc3339("2001-01-01T00:00:00Z").ok(),
             place: Place {
                 name: Some(name.into()),
                 city: Some(city.into()),
@@ -308,7 +295,10 @@ mod tests {
         assert!(old("Nowhere").join("IMG_3.jpg").exists());
         assert_eq!(state.stem("v").unwrap().as_deref(), Some("IMG_1_v"));
         assert_eq!(
-            state.exported("v", "original").unwrap().as_deref(),
+            state
+                .exported("v", crate::sources::Kind::Original)
+                .unwrap()
+                .as_deref(),
             paris.join("IMG_1_v.heic").to_str()
         );
 

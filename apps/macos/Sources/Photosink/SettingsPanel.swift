@@ -39,28 +39,36 @@ struct TemplateEditor: View {
         return s
     }
 
+    private var check: TemplateCheck? {
+        guard let p = preview else { return nil }
+        return kind == .folder ? p.folder : p.filename
+    }
+
     private func refresh() {
-        preview = model.core.preview(settings: with(text), kind: kind)
+        preview = model.core.preview(settings: with(text))
     }
 
     private func commit() {
         refresh()
-        if preview?.problem == nil && text != stored { model.save(with(text)) }
+        if check?.unknown.isEmpty != false && text != stored { model.save(with(text)) }
     }
 
-    private func utf16(_ i: String.Index) -> UInt32 {
-        UInt32(text.utf16.distance(from: text.startIndex, to: i))
+    private func part(_ s: String, _ edited: Bool) -> Text {
+        edited ? Text(s).bold() : Text(s)
     }
 
     private func insert(_ field: Field) {
-        var start = UInt32(text.utf16.count), end = start
-        if case let .selection(range)? = selection?.indices {
-            start = utf16(range.lowerBound)
-            end = utf16(range.upperBound)
+        var range = text.endIndex..<text.endIndex
+        if case let .selection(r)? = selection?.indices {
+            range = r
         }
-        let r = model.core.insertField(text: text, start: start, end: end, token: field.token, kind: kind)
-        text = r.text
-        let caret = String.Index(utf16Offset: Int(r.caret), in: text)
+        var token = field.token
+        if let before = text[..<range.lowerBound].last, !"/_-{|.".contains(before) {
+            token.insert(kind.separator, at: token.startIndex)
+        }
+        let offset = text.distance(from: text.startIndex, to: range.lowerBound) + token.count
+        text.replaceSubrange(range, with: token)
+        let caret = text.index(text.startIndex, offsetBy: offset, limitedBy: text.endIndex) ?? text.endIndex
         selection = TextSelection(range: caret..<caret)
         focused = true
         commit()
@@ -73,7 +81,7 @@ struct TemplateEditor: View {
                     title,
                     text: $text,
                     selection: $selection,
-                    prompt: Text(kind == .folder ? model.options.folderPlaceholder : model.options.filenamePlaceholder)
+                    prompt: Text(kind.placeholder)
                 )
                 .labelsHidden()
                 .font(.body.monospaced())
@@ -82,10 +90,10 @@ struct TemplateEditor: View {
                 .onChange(of: focused) { if !focused { commit() } }
                 .onChange(of: text) { refresh() }
                 Menu {
-                    ForEach(model.fields, id: \.name) { g in
+                    ForEach(FieldGroup.cases, id: \.self) { g in
                         SwiftUI.Section(g.name) {
-                            ForEach(g.fields, id: \.name) { f in
-                                Toggle(isOn: Binding(get: { preview?.used.contains(f.name) == true }, set: { _ in insert(f) })) {
+                            ForEach(model.fields.filter { $0.group == g }, id: \.name) { f in
+                                Toggle(isOn: Binding(get: { check?.used.contains(f.name) == true }, set: { _ in insert(f) })) {
                                     Text(f.token)
                                     Text(f.help)
                                 }
@@ -101,11 +109,11 @@ struct TemplateEditor: View {
             }
         } label: {
             Text(title)
-            if let p = preview {
-                if let problem = p.problem {
+            if let p = preview, let c = check {
+                if let problem = c.problem {
                     Text(problem).foregroundStyle(.red)
                 } else {
-                    Text("\(p.line) — \(p.sampleNote)")
+                    Text("\(p.rootText)/\(part(p.dirText, kind == .folder))/\(part(p.file, kind == .filename)).\(p.ext) — \(p.sampleNote)")
                 }
             }
         }
@@ -157,20 +165,20 @@ struct SettingsWindow: View {
 
     var body: some View {
         SwiftUI.TabView {
-            SwiftUI.Tab("Layout", systemImage: "folder") { page { layout($0, $1) } }
-            SwiftUI.Tab("Dates", systemImage: "calendar") { page { dates($0, $1) } }
-            SwiftUI.Tab("Filter", systemImage: "line.3.horizontal.decrease") { page { filter($0, $1) } }
-            SwiftUI.Tab("Files", systemImage: "doc.on.doc") { page { files($0, $1) } }
+            SwiftUI.Tab("Layout", systemImage: "folder") { page { layout($0) } }
+            SwiftUI.Tab("Dates", systemImage: "calendar") { page { dates($0) } }
+            SwiftUI.Tab("Filter", systemImage: "line.3.horizontal.decrease") { page { filter($0) } }
+            SwiftUI.Tab("Files", systemImage: "doc.on.doc") { page { files($0) } }
         }
         .frame(width: 600)
         .scenePadding()
     }
 
     @ViewBuilder
-    private func page<Content: View>(@ViewBuilder _ content: @escaping (Settings, Options) -> Content) -> some View {
+    private func page<Content: View>(@ViewBuilder _ content: @escaping (Settings) -> Content) -> some View {
         if let s = model.settings {
             Form {
-                content(s, model.options)
+                content(s)
                 if let e = model.settingsError {
                     SwiftUI.Section {
                         Label(e, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
@@ -206,7 +214,7 @@ struct SettingsWindow: View {
     }
 
     @ViewBuilder
-    private func layout(_ s: Settings, _ o: Options) -> some View {
+    private func layout(_ s: Settings) -> some View {
         SwiftUI.Section {
             LabeledContent("Export to") {
                 HStack {
@@ -228,22 +236,22 @@ struct SettingsWindow: View {
     }
 
     @ViewBuilder
-    private func dates(_ s: Settings, _ o: Options) -> some View {
+    private func dates(_ s: Settings) -> some View {
         SwiftUI.Section {
             Picker(selection: Binding(get: { s.dateSource }, set: { v in set(s) { $0.dateSource = v } })) {
-                ForEach(o.dateSources, id: \.label) { Text($0.label).tag($0.value) }
+                ForEach(DateSource.cases, id: \.self) { Text($0.label).tag($0) }
             } label: {
                 Text("Taken date")
-                Text(o.dateSourceHint)
+                Text(DateSource.hint)
             }
             Picker(selection: Binding(get: { s.zone }, set: { v in set(s) { $0.zone = v } })) {
-                ForEach(o.zones, id: \.label) { Text($0.label).tag($0.value) }
+                ForEach(ZoneMode.cases, id: \.self) { Text($0.label).tag($0) }
             } label: {
                 Text("Folder clock")
-                Text(o.zoneHint)
+                Text(ZoneMode.hint)
             }
             if s.zone == .fixed {
-                CommitField(title: "Offset", placeholder: o.offsetPlaceholder, value: s.offset, monospaced: true) { v in
+                CommitField(title: "Offset", placeholder: ZoneMode.offsetPlaceholder, value: s.offset, monospaced: true) { v in
                     set(s) { $0.offset = v }
                 }
             }
@@ -251,37 +259,37 @@ struct SettingsWindow: View {
     }
 
     @ViewBuilder
-    private func filter(_ s: Settings, _ o: Options) -> some View {
+    private func filter(_ s: Settings) -> some View {
         SwiftUI.Section {
             Picker("Media", selection: Binding(get: { s.media }, set: { v in set(s) { $0.media = v } })) {
-                ForEach(o.media, id: \.label) { Text($0.label).tag($0.value) }
+                ForEach(Media.cases, id: \.self) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
-            Toggle(o.favoritesLabel, isOn: Binding(get: { s.favorites }, set: { v in set(s) { $0.favorites = v } }))
+            Toggle("Favourites only", isOn: Binding(get: { s.favorites }, set: { v in set(s) { $0.favorites = v } }))
             OptionalDate(title: "Taken from", value: s.from) { v in set(s) { $0.from = v } }
             OptionalDate(title: "Taken to", value: s.to) { v in set(s) { $0.to = v } }
-            CommitField(title: "Albums", placeholder: o.listPlaceholder, value: s.albums) { v in set(s) { $0.albums = v } }
-            CommitField(title: "Keywords", placeholder: o.listPlaceholder, value: s.keywords) { v in set(s) { $0.keywords = v } }
+            CommitField(title: "Albums", placeholder: "Comma separated; any match", value: s.albums) { v in set(s) { $0.albums = v } }
+            CommitField(title: "Keywords", placeholder: "Comma separated; any match", value: s.keywords) { v in set(s) { $0.keywords = v } }
         } footer: {
-            Text(model.summaries?.filterHint ?? "").foregroundStyle(.secondary)
+            Text(s.filterHint).foregroundStyle(.secondary)
         }
     }
 
     @ViewBuilder
-    private func files(_ s: Settings, _ o: Options) -> some View {
+    private func files(_ s: Settings) -> some View {
         SwiftUI.Section {
             Picker(selection: Binding(get: { s.edits }, set: { v in set(s) { $0.edits = v } })) {
-                Text(o.editsOff).tag(false)
-                Text(o.editsOn).tag(true)
+                Text("Originals").tag(false)
+                Text("Originals + edits").tag(true)
             } label: {
                 Text("Export")
-                Text(o.editsHint)
+                Text("edits are the rendered version plus the .AAE adjustment data")
             }
             Picker(selection: Binding(get: { s.metadata }, set: { v in set(s) { $0.metadata = v } })) {
-                ForEach(o.metadata, id: \.label) { Text($0.label).tag($0.value) }
+                ForEach(Metadata.cases, id: \.self) { Text($0.label).tag($0) }
             } label: {
                 Text("Metadata")
-                Text(o.metadataHint)
+                Text(Metadata.hint)
             }
         }
     }

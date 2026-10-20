@@ -1,10 +1,11 @@
-pub mod embed;
-pub mod exif;
-pub mod geo;
-pub mod xmp;
+pub(crate) mod embed;
+pub(crate) mod exif;
+pub(crate) mod geo;
+pub(crate) mod xmp;
+
+pub use geo::Place;
 
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
-use geo::Place;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -118,10 +119,6 @@ pub struct Filter {
 }
 
 impl Filter {
-    pub fn is_empty(&self) -> bool {
-        *self == Filter::default()
-    }
-
     pub fn matches(&self, a: &Asset) -> bool {
         let media_ok = match self.media {
             Media::All => true,
@@ -148,49 +145,52 @@ impl Filter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FieldGroup {
+    Date,
+    Place,
+    Tags,
+    Camera,
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct FieldInfo {
     pub name: &'static str,
-    pub group: &'static str,
-    pub help: &'static str,
+    pub group: FieldGroup,
+    /// Takes an index, `{album:0}`.
     pub indexed: bool,
 }
 
-const fn f(
-    name: &'static str,
-    group: &'static str,
-    help: &'static str,
-    indexed: bool,
-) -> FieldInfo {
+const fn f(name: &'static str, group: FieldGroup, indexed: bool) -> FieldInfo {
     FieldInfo {
         name,
         group,
-        help,
         indexed,
     }
 }
 
 /// Every name `Asset::field` understands, for the path editor.
 pub const FIELDS: &[FieldInfo] = &[
-    f("take.year", "Date", "year taken, 2019", false),
-    f("take.month", "Date", "month taken, 05", false),
-    f("take.day", "Date", "day taken, 03", false),
-    f("take.date", "Date", "date taken, 2019-05-03", false),
-    f("place.name", "Place", "nearest named place", false),
-    f("place.city", "Place", "city", false),
-    f("place.state", "Place", "state or province", false),
-    f("place.country", "Place", "country code, FR", false),
-    f("keyword", "Tags", "keyword n", true),
-    f("album", "Tags", "album n", true),
-    f("label", "Tags", "machine label n", true),
-    f("people", "Tags", "person n", true),
-    f("camera.make", "Camera", "Apple", false),
-    f("camera.model", "Camera", "iPhone 15 Pro", false),
-    f("camera.lens", "Camera", "lens model", false),
-    f("title", "Other", "title", false),
-    f("type", "Other", "photo or video", false),
-    f("stem", "Other", "filename without extension", false),
-    f("uuid", "Other", "asset id", false),
+    f("take.year", FieldGroup::Date, false),
+    f("take.month", FieldGroup::Date, false),
+    f("take.day", FieldGroup::Date, false),
+    f("take.date", FieldGroup::Date, false),
+    f("place.name", FieldGroup::Place, false),
+    f("place.city", FieldGroup::Place, false),
+    f("place.state", FieldGroup::Place, false),
+    f("place.country", FieldGroup::Place, false),
+    f("keyword", FieldGroup::Tags, true),
+    f("album", FieldGroup::Tags, true),
+    f("label", FieldGroup::Tags, true),
+    f("people", FieldGroup::Tags, true),
+    f("camera.make", FieldGroup::Camera, false),
+    f("camera.model", FieldGroup::Camera, false),
+    f("camera.lens", FieldGroup::Camera, false),
+    f("title", FieldGroup::Other, false),
+    f("type", FieldGroup::Other, false),
+    f("stem", FieldGroup::Other, false),
+    f("uuid", FieldGroup::Other, false),
 ];
 
 pub fn field_names() -> Vec<&'static str> {
@@ -291,7 +291,7 @@ mod tests {
         let mut a = Asset::sample();
         a.favorite = true;
         let mut f = Filter::default();
-        assert!(f.is_empty() && f.matches(&a));
+        assert!(f.matches(&a));
         f.media = Media::Videos;
         assert!(!f.matches(&a));
         f.media = Media::Photos;
@@ -331,7 +331,19 @@ mod tests {
             late.zoned(DateZone::Asset).field("take.date", 0).as_deref(),
             Some("2019-05-03")
         );
+    }
+
+    #[test]
+    fn date_zone_parses_and_displays() {
         assert!("mars".parse::<DateZone>().is_err());
         assert_eq!("+02:00".parse::<DateZone>().unwrap().to_string(), "+02:00");
+    }
+
+    #[test]
+    fn every_field_resolves_for_the_sample() {
+        let a = Asset::sample();
+        for f in FIELDS {
+            assert!(a.field(f.name, 0).is_some(), "{}", f.name);
+        }
     }
 }

@@ -1,8 +1,9 @@
+use crate::copy;
 use crate::ui::{self, Toaster, hbox, label, vbox};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use photosink_bridge::Core;
-use photosink_bridge::settings::{Media, Metadata, Options, Settings, TemplateKind, ZoneMode};
+use photosink_bridge::settings::{Media, Metadata, Settings, TemplateKind, ZoneMode};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -30,7 +31,6 @@ struct DateEntry {
 /// and Files pages.
 pub struct SettingsPanel {
     core: Arc<Core>,
-    options: Options,
     toaster: Toaster,
     window_toaster: Toaster,
     pub root: adw::PreferencesDialog,
@@ -77,9 +77,14 @@ impl Template {
         groups.set_margin_top(6);
         groups.set_margin_bottom(6);
         let mut fields = Vec::new();
-        for g in core.fields() {
+        let all = core.fields();
+        for g in copy::FIELD_GROUPS {
+            let members: Vec<_> = all.iter().filter(|f| f.group == g).collect();
+            if members.is_empty() {
+                continue;
+            }
             let group = vbox(4);
-            group.append(&label(&g.name, &["heading"]));
+            group.append(&label(copy::field_group(g), &["heading"]));
             let flow = gtk::FlowBox::builder()
                 .selection_mode(gtk::SelectionMode::None)
                 .homogeneous(false)
@@ -87,12 +92,12 @@ impl Template {
                 .column_spacing(4)
                 .max_children_per_line(6)
                 .build();
-            for f in g.fields {
+            for f in members {
                 let b = gtk::Button::with_label(&f.name);
-                b.set_tooltip_text(Some(&f.help));
+                b.set_tooltip_text(Some(copy::field_help(&f.name)));
                 b.add_css_class("monospace");
                 flow.insert(&b, -1);
-                fields.push((f.name, f.token, b));
+                fields.push((f.name.clone(), f.token.clone(), b));
             }
             group.append(&flow);
             groups.append(&group);
@@ -171,7 +176,7 @@ impl DateEntry {
     }
 }
 
-fn segmented<T: Copy>(items: &[(T, String)]) -> (gtk::Box, Vec<(T, gtk::ToggleButton)>) {
+fn segmented<T: Copy>(items: &[(T, &str)]) -> (gtk::Box, Vec<(T, gtk::ToggleButton)>) {
     let b = hbox(0);
     b.add_css_class("linked");
     b.set_valign(gtk::Align::Center);
@@ -187,13 +192,12 @@ fn segmented<T: Copy>(items: &[(T, String)]) -> (gtk::Box, Vec<(T, gtk::ToggleBu
     (b, out)
 }
 
-fn combo(title: &str, subtitle: &str, labels: &[String]) -> adw::ComboRow {
-    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+fn combo(title: &str, subtitle: &str, labels: &[&str]) -> adw::ComboRow {
     adw::ComboRow::builder()
         .title(title)
         .subtitle(subtitle)
         .use_markup(false)
-        .model(&gtk::StringList::new(&labels))
+        .model(&gtk::StringList::new(labels))
         .build()
 }
 
@@ -273,7 +277,7 @@ impl SettingsPanel {
                 if let Some(w) = mark {
                     w.add_css_class("error");
                 }
-                self.toaster.show(e.to_string());
+                self.toaster.show(copy::settings_error(&e));
             }
         }
     }
@@ -298,8 +302,8 @@ impl SettingsPanel {
 
     fn update_previews(&self) {
         let Some(s) = self.candidate() else { return };
-        for t in [&self.folder, &self.filename] {
-            let p = self.core.preview(s.clone(), t.kind);
+        let p = self.core.preview(s);
+        for (t, check) in [(&self.folder, &p.folder), (&self.filename, &p.filename)] {
             let bold = |part: &str, on: bool| {
                 let e = glib::markup_escape_text(part);
                 if on {
@@ -310,18 +314,19 @@ impl SettingsPanel {
             };
             t.line.set_markup(&format!(
                 "{}/{}/{}.{}",
-                glib::markup_escape_text(&p.root),
-                bold(&p.dir, t.kind == TemplateKind::Folder),
+                glib::markup_escape_text(copy::preview_root(p.root.as_deref())),
+                bold(copy::preview_dir(&p.dir), t.kind == TemplateKind::Folder),
                 bold(&p.file, t.kind == TemplateKind::Filename),
                 glib::markup_escape_text(&p.ext)
             ));
-            t.note.set_text(&p.sample_note);
-            let problem = p.problem.unwrap_or_default();
+            t.note
+                .set_text(&copy::preview_sample(p.exported_stem.as_deref()));
+            let problem = copy::preview_problem(&check.unknown).unwrap_or_default();
             t.problem.set_text(&problem);
             t.problem.set_visible(!problem.is_empty());
             ui::set_class(&t.row, "error", !problem.is_empty());
             for (name, _, button) in &t.fields {
-                ui::set_class(button, "accent", p.used.contains(name));
+                ui::set_class(button, "accent", check.used.contains(name));
             }
         }
     }
@@ -342,7 +347,12 @@ impl SettingsPanel {
     fn commit_template(&self, kind: TemplateKind) {
         let Some(s) = self.candidate() else { return };
         let text = self.template(kind).row.text().to_string();
-        if self.core.preview(s, kind).problem.is_some() {
+        let p = self.core.preview(s);
+        let check = match kind {
+            TemplateKind::Folder => p.folder,
+            TemplateKind::Filename => p.filename,
+        };
+        if !check.unknown.is_empty() {
             return;
         }
         let row: gtk::Widget = self.template(kind).row.clone().upcast();
@@ -355,19 +365,27 @@ impl SettingsPanel {
     fn insert_field(&self, kind: TemplateKind, token: &str) {
         let row = &self.template(kind).row;
         let text = row.text().to_string();
-        let (start, end) = row.selection_bounds().unwrap_or_else(|| {
+        let (a, b) = row.selection_bounds().unwrap_or_else(|| {
             let p = row.position();
             (p, p)
         });
-        let ins = self.core.insert_field(
-            text.clone(),
-            ui::utf16_offset(&text, start),
-            ui::utf16_offset(&text, end),
-            token.to_owned(),
-            kind,
-        );
-        row.set_text(&ins.text);
-        row.set_position(ui::char_offset(&ins.text, ins.caret));
+        let chars: Vec<char> = text.chars().collect();
+        let start = (a.min(b).max(0) as usize).min(chars.len());
+        let end = (a.max(b).max(0) as usize).min(chars.len());
+        let separator = match kind {
+            TemplateKind::Folder => '/',
+            TemplateKind::Filename => '_',
+        };
+        let needs_separator = start > 0 && !"/_-{|.".contains(chars[start - 1]);
+        let mut out: String = chars[..start].iter().collect();
+        if needs_separator {
+            out.push(separator);
+        }
+        out.push_str(token);
+        let caret = out.chars().count();
+        out.extend(&chars[end..]);
+        row.set_text(&out);
+        row.set_position(caret as i32);
         self.update_previews();
         self.commit_template(kind);
     }
@@ -375,12 +393,13 @@ impl SettingsPanel {
     fn refresh_summaries(&self) {
         let Some(s) = self.current() else { return };
         self.export_row.set_subtitle(&s.export_dir);
-        let m = self.core.summaries(s);
-        self.layout.set_description(&m.layout);
-        self.dates.set_description(&m.dates);
-        self.filter.set_description(&m.filter);
-        self.files.set_description(&m.files);
-        self.filter_group.set_description(Some(&m.filter_hint));
+        self.layout.set_description(&copy::layout_summary(&s));
+        self.dates
+            .set_description(&copy::dates_settings_summary(&s));
+        self.filter.set_description(&copy::filter_summary(&s));
+        self.files.set_description(&copy::files_summary(&s));
+        self.filter_group
+            .set_description(Some(copy::filter_hint(&s)));
         self.update_previews();
     }
 
@@ -412,7 +431,7 @@ impl SettingsPanel {
         let s = match self.core.settings() {
             Ok(s) => s,
             Err(e) => {
-                self.window_toaster.show(e.to_string());
+                self.window_toaster.show(copy::settings_error(&e));
                 self.root.set_sensitive(false);
                 return;
             }
@@ -420,11 +439,10 @@ impl SettingsPanel {
         self.loading.set(true);
         self.folder.row.set_text(&s.path);
         self.filename.row.set_text(&s.filename);
-        let o = &self.options;
-        if let Some(i) = o.date_sources.iter().position(|d| d.value == s.date_source) {
+        if let Some(i) = copy::DATE_SOURCES.iter().position(|d| *d == s.date_source) {
             self.date_source.set_selected(i as u32);
         }
-        if let Some(i) = o.zones.iter().position(|z| z.value == s.zone) {
+        if let Some(i) = copy::ZONES.iter().position(|z| *z == s.zone) {
             self.zone.set_selected(i as u32);
         }
         self.offset.set_text(&s.offset);
@@ -533,12 +551,7 @@ impl SettingsPanel {
         let weak = Rc::downgrade(self);
         self.date_source.connect_selected_notify(move |row| {
             let Some(panel) = weak.upgrade() else { return };
-            let Some(v) = panel
-                .options
-                .date_sources
-                .get(row.selected() as usize)
-                .map(|d| d.value)
-            else {
+            let Some(v) = copy::DATE_SOURCES.get(row.selected() as usize).copied() else {
                 return;
             };
             panel.edit(|s| s.date_source = v);
@@ -546,12 +559,7 @@ impl SettingsPanel {
         let weak = Rc::downgrade(self);
         self.zone.connect_selected_notify(move |row| {
             let Some(panel) = weak.upgrade() else { return };
-            let Some(v) = panel
-                .options
-                .zones
-                .get(row.selected() as usize)
-                .map(|z| z.value)
-            else {
+            let Some(v) = copy::ZONES.get(row.selected() as usize).copied() else {
                 return;
             };
             panel.offset.set_visible(v == ZoneMode::Fixed);
@@ -604,7 +612,6 @@ impl SettingsPanel {
     }
 
     pub fn new(core: Arc<Core>, window_toaster: Toaster) -> Rc<SettingsPanel> {
-        let o = core.options();
         let root = adw::PreferencesDialog::new();
         root.set_search_enabled(false);
         let toaster = Toaster::Preferences(root.clone());
@@ -622,12 +629,17 @@ impl SettingsPanel {
         export_row.set_activatable_widget(Some(&export_button));
 
         let layout = page("Layout", "folder-symbolic");
-        let folder = Template::new(&core, TemplateKind::Folder, "Folder", &o.folder_placeholder);
+        let folder = Template::new(
+            &core,
+            TemplateKind::Folder,
+            "Folder",
+            copy::FOLDER_PLACEHOLDER,
+        );
         let filename = Template::new(
             &core,
             TemplateKind::Filename,
             "Filename",
-            &o.filename_placeholder,
+            copy::FILENAME_PLACEHOLDER,
         );
         layout.add(&group_of(&[export_row.upcast_ref()]));
         layout.add(&group_of(&[
@@ -642,29 +654,20 @@ impl SettingsPanel {
         let dates = page("Dates", "x-office-calendar-symbolic");
         let date_source = combo(
             "Taken date",
-            &o.date_source_hint,
-            &o.date_sources
-                .iter()
-                .map(|d| d.label.clone())
-                .collect::<Vec<_>>(),
+            copy::DATE_SOURCE_HINT,
+            &copy::DATE_SOURCES.map(copy::date_source),
         );
         let zone = combo(
             "Folder clock",
-            &o.zone_hint,
-            &o.zones.iter().map(|z| z.label.clone()).collect::<Vec<_>>(),
+            copy::ZONE_HINT,
+            &copy::ZONES.map(copy::zone),
         );
-        let fixed = o
-            .zones
-            .iter()
-            .find(|z| z.value == ZoneMode::Fixed)
-            .map(|z| z.label.clone())
-            .unwrap_or_default();
         let offset = adw::EntryRow::builder()
-            .title(fixed)
+            .title(copy::zone(ZoneMode::Fixed))
             .use_markup(false)
             .show_apply_button(true)
             .build();
-        ui::row_placeholder(&offset, &o.offset_placeholder);
+        ui::row_placeholder(&offset, copy::OFFSET_PLACEHOLDER);
         dates.add(&group_of(&[
             date_source.upcast_ref(),
             zone.upcast_ref(),
@@ -672,22 +675,17 @@ impl SettingsPanel {
         ]));
 
         let filter = page("Filter", "edit-find-symbolic");
-        let (media_box, media) = segmented(
-            &o.media
-                .iter()
-                .map(|m| (m.value, m.label.clone()))
-                .collect::<Vec<_>>(),
-        );
+        let (media_box, media) = segmented(&copy::MEDIA.map(|m| (m, copy::media(m))));
         let media_row = adw::ActionRow::builder().title("Media").build();
         media_row.add_suffix(&media_box);
         let favorites = adw::SwitchRow::builder()
-            .title(&o.favorites_label)
+            .title(copy::FAVORITES)
             .use_markup(false)
             .build();
         let from = DateEntry::new("From");
         let to = DateEntry::new("To");
-        let albums = list_row("Albums", &o.list_placeholder);
-        let keywords = list_row("Keywords", &o.list_placeholder);
+        let albums = list_row("Albums", copy::LIST_PLACEHOLDER);
+        let keywords = list_row("Keywords", copy::LIST_PLACEHOLDER);
         let filter_group = group_of(&[
             media_row.upcast_ref(),
             favorites.upcast_ref(),
@@ -699,23 +697,17 @@ impl SettingsPanel {
         filter.add(&filter_group);
 
         let files = page("Files", "document-save-symbolic");
-        let (edits_box, edits) =
-            segmented(&[(false, o.edits_off.clone()), (true, o.edits_on.clone())]);
+        let (edits_box, edits) = segmented(&[(false, copy::EDITS_OFF), (true, copy::EDITS_ON)]);
         let edits_row = adw::ActionRow::builder()
             .title("Export")
-            .subtitle(&o.edits_hint)
+            .subtitle(copy::EDITS_HINT)
             .use_markup(false)
             .build();
         edits_row.add_suffix(&edits_box);
-        let (metadata_box, metadata) = segmented(
-            &o.metadata
-                .iter()
-                .map(|m| (m.value, m.label.clone()))
-                .collect::<Vec<_>>(),
-        );
+        let (metadata_box, metadata) = segmented(&copy::METADATA.map(|m| (m, copy::metadata(m))));
         let metadata_row = adw::ActionRow::builder()
             .title("Metadata")
-            .subtitle(&o.metadata_hint)
+            .subtitle(copy::METADATA_HINT)
             .use_markup(false)
             .build();
         metadata_row.add_suffix(&metadata_box);
@@ -730,7 +722,6 @@ impl SettingsPanel {
 
         let panel = Rc::new(SettingsPanel {
             core,
-            options: o,
             toaster,
             window_toaster,
             root,

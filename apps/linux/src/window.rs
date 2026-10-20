@@ -1,3 +1,4 @@
+use crate::copy;
 use crate::settings_panel::SettingsPanel;
 use crate::tab_page::TabPage;
 use crate::ui::{Toaster, hbox, label};
@@ -49,15 +50,14 @@ impl Window {
         let Some(tab) = self.current.get() else {
             return;
         };
-        let st = self.core.status();
         let subtitle = match self.core.blocker(tab) {
-            Some(b) if st.running.is_none() => b,
-            _ => std::iter::once(st.text.clone())
+            Some(b) if self.core.running().is_none() => copy::blocker(tab, &b),
+            _ => std::iter::once(copy::status(&self.core.status()))
                 .chain(
                     self.core
                         .stats(tab)
                         .into_iter()
-                        .map(|s| format!("{} {}", s.label, s.value)),
+                        .map(|s| format!("{} {}", copy::stat(s.kind), s.count)),
                 )
                 .collect::<Vec<_>>()
                 .join(" · "),
@@ -66,14 +66,14 @@ impl Window {
     }
 
     fn select(&self, tab: Tab) {
-        let Some(page) = self.pages.get(&tab) else {
+        if !self.pages.contains_key(&tab) {
             return;
-        };
+        }
         self.current.set(Some(tab));
         self.content.set_visible_child_name(&page_name(tab));
         self.header.set_visible_child_name(&page_name(tab));
-        self.title.set_title(&page.info.name);
-        self.content_page.set_title(&page.info.name);
+        self.title.set_title(copy::tab_name(tab));
+        self.content_page.set_title(copy::tab_name(tab));
         if let Some((_, row)) = self.rows.iter().find(|(t, _)| *t == tab)
             && !row.is_selected()
         {
@@ -84,8 +84,9 @@ impl Window {
 
     fn status(&self) {
         let st = self.core.status();
+        let running = self.core.running();
         for (tab, row) in &self.rows {
-            row.set_sensitive(st.running.is_none_or(|t| t == *tab));
+            row.set_sensitive(running.is_none_or(|t| t == *tab));
         }
         for page in self.pages.values() {
             page.refresh_run();
@@ -94,9 +95,10 @@ impl Window {
                 d.refresh();
             }
         }
-        let fresh_error = st.error && self.last_status.borrow().as_ref() != Some(&st);
+        let fresh_error =
+            copy::status_is_error(&st) && self.last_status.borrow().as_ref() != Some(&st);
         if fresh_error {
-            self.toaster.show(&st.text);
+            self.toaster.show(copy::status(&st));
         }
         self.last_status.replace(Some(st));
         self.refresh_title();
@@ -140,27 +142,28 @@ impl Window {
         header.set_hhomogeneous(false);
         let mut rows = Vec::new();
         let mut pages = HashMap::new();
-        let mut first_in_group: HashMap<i32, String> = HashMap::new();
-        for group in core.groups() {
-            for (i, info) in group.tabs.iter().enumerate() {
-                let row_box = hbox(12);
-                row_box.append(&gtk::Image::from_icon_name(icon(info.tab)));
-                row_box.append(&label(&info.name, &[]));
-                let row = gtk::ListBoxRow::builder().child(&row_box).build();
-                sidebar.append(&row);
-                if i == 0 {
-                    first_in_group.insert(row.index(), group.name.clone());
-                }
-                rows.push((info.tab, row));
-                let page = TabPage::new(core.clone(), info.clone(), toaster.clone());
-                content.add_named(&page.content, Some(&page_name(info.tab)));
-                header.add_named(&page.header, Some(&page_name(info.tab)));
-                pages.insert(info.tab, page);
+        let mut first_in_group: HashMap<i32, copy::Group> = HashMap::new();
+        let mut last_group = None;
+        for tab in core.tabs() {
+            let row_box = hbox(12);
+            row_box.append(&gtk::Image::from_icon_name(icon(tab)));
+            row_box.append(&label(copy::tab_name(tab), &[]));
+            let row = gtk::ListBoxRow::builder().child(&row_box).build();
+            sidebar.append(&row);
+            let group = copy::group(tab);
+            if last_group != Some(group) {
+                first_in_group.insert(row.index(), group);
+                last_group = Some(group);
             }
+            rows.push((tab, row));
+            let page = TabPage::new(core.clone(), tab, toaster.clone());
+            content.add_named(&page.content, Some(&page_name(tab)));
+            header.add_named(&page.header, Some(&page_name(tab)));
+            pages.insert(tab, page);
         }
         sidebar.set_header_func(move |row, _| {
-            let heading = first_in_group.get(&row.index()).map(|name| {
-                let l = label(name, &["heading", "dim-label"]);
+            let heading = first_in_group.get(&row.index()).map(|group| {
+                let l = label(group.name(), &["heading", "dim-label"]);
                 l.set_margin_start(12);
                 l.set_margin_top(if row.index() == 0 { 6 } else { 18 });
                 l.set_margin_bottom(6);

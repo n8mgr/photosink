@@ -1,12 +1,12 @@
-use crate::photo::geo;
 use crate::photo::{Asset, Camera};
+use crate::{Event, Progress};
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub fn cocoa_time(secs: f64, offset: i32) -> Option<DateTime<FixedOffset>> {
+fn cocoa_time(secs: f64, offset: i32) -> Option<DateTime<FixedOffset>> {
     let utc = Utc.timestamp_opt(978_307_200 + secs as i64, 0).single()?;
     Some(utc.with_timezone(&FixedOffset::east_opt(offset)?))
 }
@@ -47,7 +47,7 @@ fn grouped(conn: &Connection, sql: &str) -> Result<HashMap<i64, Vec<String>>> {
     Ok(out)
 }
 
-pub fn load_assets(conn: &Connection) -> Result<HashMap<String, Asset>> {
+fn load_assets(conn: &Connection, progress: Progress) -> Result<HashMap<String, Asset>> {
     let keywords = match find_join(conn, "ASSETATTRIBUTES", "KEYWORDS")? {
         Some((t, a, k)) => grouped(
             conn,
@@ -56,7 +56,9 @@ pub fn load_assets(conn: &Connection) -> Result<HashMap<String, Asset>> {
             ),
         )?,
         None => {
-            eprintln!("warning: keyword join table not found");
+            progress(Event::Warning {
+                text: "keyword table not found, keywords unavailable".into(),
+            });
             HashMap::new()
         }
     };
@@ -68,7 +70,9 @@ pub fn load_assets(conn: &Connection) -> Result<HashMap<String, Asset>> {
             ),
         )?,
         None => {
-            eprintln!("warning: album join table not found");
+            progress(Event::Warning {
+                text: "album table not found, albums unavailable".into(),
+            });
             HashMap::new()
         }
     };
@@ -111,7 +115,7 @@ pub fn load_assets(conn: &Connection) -> Result<HashMap<String, Asset>> {
                 },
                 place: r
                     .get::<_, Option<Vec<u8>>>(12)?
-                    .map(|b| geo::place(&b))
+                    .map(|b| super::place::place(&b))
                     .unwrap_or_default(),
                 ..Default::default()
             },
@@ -129,12 +133,12 @@ pub fn load_assets(conn: &Connection) -> Result<HashMap<String, Asset>> {
 }
 
 #[derive(Debug, Default, PartialEq)]
-pub struct Indexed {
-    pub labels: Vec<String>,
-    pub people: Vec<String>,
+struct Indexed {
+    labels: Vec<String>,
+    people: Vec<String>,
 }
 
-pub fn load_index(conn: &Connection) -> Result<HashMap<String, Indexed>> {
+fn load_index(conn: &Connection) -> Result<HashMap<String, Indexed>> {
     let mut stmt = conn.prepare("SELECT lexeme_id, category, content FROM lexicon WHERE category IN (3000, 4000) AND type = 1 AND content != ''")?;
     let lexicon: HashMap<u32, (i64, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
@@ -199,12 +203,12 @@ fn copy_db(src: &Path, dir: &Path) -> Result<Option<Connection>> {
     )?))
 }
 
-pub fn load(library: &Path) -> Result<HashMap<String, Asset>> {
+pub(crate) fn load(library: &Path, progress: Progress) -> Result<HashMap<String, Asset>> {
     let db = library.join("database");
     let tmp = tempfile::tempdir()?;
     let photos = copy_db(&db.join("Photos.sqlite"), tmp.path())?
-        .context("Photos.sqlite not found (grant Full Disk Access to the terminal)")?;
-    let mut assets = load_assets(&photos)?;
+        .context("Photos.sqlite not found (grant Full Disk Access to Photosink)")?;
+    let mut assets = load_assets(&photos, progress)?;
     match copy_db(&db.join("search/leo.sqlite"), tmp.path())? {
         Some(search) => {
             for (uuid, indexed) in load_index(&search)? {
@@ -214,7 +218,9 @@ pub fn load(library: &Path) -> Result<HashMap<String, Asset>> {
                 }
             }
         }
-        None => eprintln!("warning: search index not found, labels and people unavailable"),
+        None => progress(Event::Warning {
+            text: "search index not found, labels and people unavailable".into(),
+        }),
     }
     Ok(assets)
 }
@@ -222,18 +228,7 @@ pub fn load(library: &Path) -> Result<HashMap<String, Asset>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::photo::geo::Place;
-
-    #[test]
-    #[ignore]
-    fn loads_real_library() {
-        let lib = std::env::var("PHOTOS_LIBRARY").expect("PHOTOS_LIBRARY");
-        let assets = load(Path::new(&lib)).unwrap();
-        assert!(!assets.is_empty());
-        for a in assets.values() {
-            println!("{}", serde_json::to_string(a).unwrap());
-        }
-    }
+    use crate::photo::Place;
 
     fn fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -286,7 +281,7 @@ mod tests {
 
     #[test]
     fn loads_assets_with_relations() {
-        let assets = load_assets(&fixture()).unwrap();
+        let assets = load_assets(&fixture(), &|_| {}).unwrap();
         assert_eq!(assets.len(), 2);
         let a = &assets["U1"];
         assert_eq!(a.filename, "IMG_1.HEIC");

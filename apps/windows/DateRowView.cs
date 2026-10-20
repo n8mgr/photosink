@@ -1,10 +1,9 @@
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
-using Microsoft.UI.Xaml.Input;
 using System;
 using System.Collections.Generic;
-using Windows.System;
 using uniffi.photosink_bridge;
 
 namespace Photosink;
@@ -17,13 +16,15 @@ public sealed partial class DateRowView : Grid
     private readonly TextBlock current = new() { VerticalAlignment = VerticalAlignment.Center };
     private readonly StackPanel options = new() { Orientation = Orientation.Horizontal, Spacing = 4 };
     private readonly List<ToggleButton> buttons = new();
-    private readonly TextBox manual = new() { Width = 240, IsSpellCheckEnabled = false };
-    private readonly TextBlock error = new() { TextWrapping = TextWrapping.Wrap, MaxWidth = 240 };
-    private readonly FontIcon chosen = new() { Glyph = "\uE73E", FontSize = 14, VerticalAlignment = VerticalAlignment.Center };
+    private readonly CalendarDatePicker manualDate = new() { PlaceholderText = "Manual date", VerticalAlignment = VerticalAlignment.Center };
+    private readonly TimePicker manualTime = new() { VerticalAlignment = VerticalAlignment.Center };
+    private readonly Button clearManual = new() { Content = new FontIcon { Glyph = "", FontSize = 12 }, VerticalAlignment = VerticalAlignment.Center };
+    private readonly FontIcon chosen = new() { Glyph = "", FontSize = 14, VerticalAlignment = VerticalAlignment.Center };
     private DateKey[] keys = Array.Empty<DateKey>();
     private Core? core;
     private string uuid = "";
-    private string committed = "";
+    private long? manual;
+    private bool updating;
 
     public DateRowView()
     {
@@ -45,45 +46,44 @@ public sealed partial class DateRowView : Grid
         SetColumn(current, 1);
         SetColumn(options, 2);
 
-        error.Style = Ui.Style("CriticalText");
-        manual.FontFamily = Ui.Mono;
-        manual.KeyDown += (_, e) =>
-        {
-            if (e.Key == VirtualKey.Enter)
-            {
-                Commit();
-                e.Handled = true;
-            }
-        };
-        manual.LostFocus += (_, _) => Commit();
-        var field = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
-        field.Children.Add(manual);
+        AutomationProperties.SetName(manualDate, "Manual date");
+        AutomationProperties.SetName(manualTime, "Manual time");
+        AutomationProperties.SetName(clearManual, "Clear manual date");
+        ToolTipService.SetToolTip(clearManual, "Clear manual date");
+        manualDate.DateChanged += (_, _) => Commit();
+        manualTime.SelectedTimeChanged += (_, _) => Commit();
+        clearManual.Click += (_, _) => core?.DatesManual(uuid, null);
+        var field = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+        field.Children.Add(manualDate);
+        field.Children.Add(manualTime);
+        field.Children.Add(clearManual);
         field.Children.Add(chosen);
-        var typed = new StackPanel { Spacing = 2, VerticalAlignment = VerticalAlignment.Center };
-        typed.Children.Add(field);
-        typed.Children.Add(error);
-        SetColumn(typed, 3);
+        SetColumn(field, 3);
 
         Children.Add(name);
         Children.Add(current);
         Children.Add(options);
-        Children.Add(typed);
+        Children.Add(field);
     }
 
     private void Commit()
     {
-        if (core is null || manual.Text == committed)
+        if (core is null || updating)
         {
             return;
         }
-        committed = manual.Text;
-        ShowError(core.DatesManual(uuid, manual.Text) ?? "");
-    }
-
-    private void ShowError(string text)
-    {
-        error.Text = text;
-        error.Visibility = text.Length > 0 ? Visibility.Visible : Visibility.Collapsed;
+        long? at = null;
+        if (manualDate.Date is { } day)
+        {
+            var wall = new DateTime(day.Year, day.Month, day.Day, 0, 0, 0, DateTimeKind.Utc) + (manualTime.SelectedTime ?? TimeSpan.Zero);
+            at = new DateTimeOffset(wall, TimeSpan.Zero).ToUnixTimeSeconds();
+        }
+        if (at == manual)
+        {
+            return;
+        }
+        manual = at;
+        core.DatesManual(uuid, at);
     }
 
     private ToggleButton Option(int index)
@@ -110,7 +110,7 @@ public sealed partial class DateRowView : Grid
         folder.Text = row.Folder + "/";
         stem.Text = row.Video ? row.Stem + " ▸" : row.Stem;
         ToolTipService.SetToolTip(stem, row.Uuid);
-        current.Text = row.Current;
+        current.Text = row.Current is { } at ? Copy.Date(at) : "no date";
 
         keys = Array.ConvertAll(row.Options, o => o.Key);
         while (buttons.Count < row.Options.Length)
@@ -129,21 +129,31 @@ public sealed partial class DateRowView : Grid
             }
             var o = row.Options[i];
             var content = (StackPanel)b.Content;
-            ((TextBlock)content.Children[0]).Text = o.Label;
-            ((TextBlock)content.Children[1]).Text = o.Value.Length > 0 ? o.Value : "—";
+            ((TextBlock)content.Children[0]).Text = Copy.KeyLabel(o.Key);
+            ((TextBlock)content.Children[1]).Text = o.Value is { } v ? Copy.Date(v) : "—";
             b.IsChecked = o.Chosen;
-            b.IsEnabled = o.Value.Length > 0 && view.CanPick;
+            b.IsEnabled = o.Value is not null && view.CanPick;
             b.Opacity = o.SameDay ? 0.55 : 1;
         }
 
-        manual.PlaceholderText = view.ManualPlaceholder;
-        manual.IsEnabled = view.CanPick;
-        if (manual.FocusState == FocusState.Unfocused)
+        updating = true;
+        manual = row.Manual;
+        if (row.Manual is { } m)
         {
-            manual.Text = row.Manual;
-            committed = row.Manual;
+            var wall = DateTimeOffset.FromUnixTimeSeconds(m).UtcDateTime;
+            var day = DateTime.SpecifyKind(wall.Date, DateTimeKind.Unspecified);
+            manualDate.Date = new DateTimeOffset(day, TimeZoneInfo.Local.GetUtcOffset(day));
+            manualTime.SelectedTime = wall.TimeOfDay;
         }
+        else
+        {
+            manualDate.Date = null;
+            manualTime.SelectedTime = null;
+        }
+        updating = false;
+        manualDate.IsEnabled = manualTime.IsEnabled = view.CanPick;
+        clearManual.Visibility = row.Manual is null ? Visibility.Collapsed : Visibility.Visible;
+        clearManual.IsEnabled = view.CanPick;
         chosen.Visibility = row.ManualChosen ? Visibility.Visible : Visibility.Collapsed;
-        ShowError(row.ManualError);
     }
 }

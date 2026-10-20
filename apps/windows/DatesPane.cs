@@ -1,6 +1,5 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
-using System;
 using uniffi.photosink_bridge;
 
 namespace Photosink;
@@ -48,15 +47,13 @@ internal sealed partial class DatesPane : Grid
         }
     }
 
-    /// <summary>Re-reads the rows; returns the first row's date options, which "Choose all" offers.</summary>
-    internal DateOption[] Refresh(DatesView next)
+    internal void Refresh(DatesView next)
     {
         view = next;
         var length = (int)core.DatesLen();
         rows.Refresh(length, false);
-        empty.Text = next.EmptyText;
+        empty.Text = Copy.DatesEmpty(next);
         empty.Visibility = length == 0 ? Visibility.Visible : Visibility.Collapsed;
         RenderRealized(next);
-        return length > 0 && rows[0] is DateRow first ? first.Options : Array.Empty<DateOption>();
     }
 }

@@ -112,8 +112,8 @@ pub fn read(xmp: &str) -> Option<Asset> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::photo::Camera;
-    use crate::photo::geo::Place;
+    use crate::photo::{Camera, Place};
+    use chrono::DateTime;
 
     #[test]
     fn round_trips_and_formats() {
@@ -122,7 +122,7 @@ mod tests {
             filename: "IMG_1.CR3".into(),
             title: Some("A <b> & \"c\"".into()),
             description: Some("desc".into()),
-            taken: crate::sources::apple_photos::library::cocoa_time(0.0, 3600),
+            taken: DateTime::parse_from_rfc3339("2001-01-01T01:00:00+01:00").ok(),
             latitude: Some(48.8566),
             longitude: Some(-2.3522),
             favorite: true,

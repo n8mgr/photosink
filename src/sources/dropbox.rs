@@ -1,4 +1,5 @@
-use super::{Kind, Resource, Source, is_media, is_video};
+use super::oauth::{Provider, Session, Token, now};
+use super::{Source, is_media, is_video};
 use crate::export::write_hashed;
 use crate::photo::Asset;
 use crate::{Event, Progress};
@@ -6,45 +7,49 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::DateTime;
-use reqwest::blocking::{Client, RequestBuilder, Response};
-use serde::{Deserialize, Serialize};
+use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 const AUTHORIZE: &str = "https://www.dropbox.com/oauth2/authorize";
 const TOKEN: &str = "https://api.dropboxapi.com/oauth2/token";
 const API: &str = "https://api.dropboxapi.com/2";
 const CONTENT: &str = "https://content.dropboxapi.com/2";
 /// Must be registered as a redirect URI on the Dropbox app.
-pub const REDIRECT: &str = "http://localhost:53917/dropbox";
+const REDIRECT: &str = "http://localhost:53917/dropbox";
 const LISTEN: &str = "127.0.0.1:53917";
 const SIGN_IN_WAIT: Duration = Duration::from_secs(600);
 
-#[derive(Serialize, Deserialize, Default)]
-struct Token {
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-}
-
-pub struct Dropbox {
-    client: Client,
+struct DropboxAuth {
     app_key: String,
-    token_path: PathBuf,
-    token: Mutex<Token>,
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+pub(crate) struct Dropbox {
+    session: Session<DropboxAuth>,
+}
+
+impl Provider for DropboxAuth {
+    fn login(&self, client: &Client, progress: Progress) -> Result<Token> {
+        browser_login(client, &self.app_key, progress)
+    }
+
+    fn refresh(&self, client: &Client, refresh_token: &str) -> Result<Token> {
+        let v: Value = client
+            .post(TOKEN)
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", self.app_key.as_str()),
+            ])
+            .send()?
+            .json()?;
+        token_from(&v, Some(refresh_token))
+    }
 }
 
 fn random(n: usize) -> Result<String> {
@@ -194,100 +199,35 @@ fn browser_login(client: &Client, app_key: &str, progress: Progress) -> Result<T
 }
 
 impl Dropbox {
-    pub fn connect(app_key: &str, token_path: &Path, progress: Progress) -> Result<Dropbox> {
+    pub(crate) fn connect(app_key: &str, token_path: &Path, progress: Progress) -> Result<Dropbox> {
         anyhow::ensure!(
             !app_key.trim().is_empty(),
             "set dropbox_app_key in the config to your Dropbox app's key"
         );
-        let client = Client::builder()
-            .timeout(Duration::from_secs(3600))
-            .build()?;
-        let token = match std::fs::read(token_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(_) => browser_login(&client, app_key, progress)?,
-        };
-        let db = Dropbox {
-            client,
+        let provider = DropboxAuth {
             app_key: app_key.to_owned(),
-            token_path: token_path.to_owned(),
-            token: Mutex::new(token),
         };
-        db.save_token()?;
-        Ok(db)
-    }
-
-    fn save_token(&self) -> Result<()> {
-        if let Some(dir) = self.token_path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(
-            &self.token_path,
-            serde_json::to_vec(&*self.token.lock().unwrap())?,
-        )?;
-        Ok(())
-    }
-
-    fn access_token(&self) -> Result<String> {
-        let refresh = {
-            let t = self.token.lock().unwrap();
-            if t.expires_at > now() + 60 {
-                return Ok(t.access_token.clone());
-            }
-            t.refresh_token.clone()
-        };
-        let v: Value = self
-            .client
-            .post(TOKEN)
-            .form(&[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh.as_str()),
-                ("client_id", self.app_key.as_str()),
-            ])
-            .send()?
-            .json()?;
-        let token = token_from(&v, Some(&refresh))?;
-        let access = token.access_token.clone();
-        *self.token.lock().unwrap() = token;
-        self.save_token()?;
-        Ok(access)
-    }
-
-    fn send(&self, what: &str, request: impl Fn() -> RequestBuilder) -> Result<Response> {
-        for _ in 0..5 {
-            let resp = request().bearer_auth(self.access_token()?).send()?;
-            if matches!(resp.status().as_u16(), 429 | 503) {
-                let wait = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok()?.parse().ok())
-                    .unwrap_or(5);
-                std::thread::sleep(Duration::from_secs(wait));
-                continue;
-            }
-            if !resp.status().is_success() {
-                let status = resp.status();
-                bail!("{what}: {status} {}", resp.text().unwrap_or_default());
-            }
-            return Ok(resp);
-        }
-        bail!("{what}: throttled")
+        Ok(Dropbox {
+            session: Session::connect(provider, token_path, progress)?,
+        })
     }
 
     fn rpc(&self, endpoint: &str, body: &Value) -> Result<Value> {
         let url = format!("{API}/{endpoint}");
         Ok(self
-            .send(endpoint, || self.client.post(&url).json(body))?
+            .session
+            .send(endpoint, || self.session.client.post(&url).json(body))?
             .json()?)
     }
 
-    /// Media files under `folder` (empty for the whole Dropbox), or only those
+    /// Media files under `folder` (no surrounding slashes, empty for the whole
+    /// Dropbox), or only those
     /// changed since `cursor`, and the cursor to resume from next time.
-    pub fn list(
+    pub(crate) fn list(
         &self,
         folder: &str,
         cursor: Option<String>,
     ) -> Result<(HashMap<String, Asset>, String)> {
-        let folder = folder.trim().trim_matches('/');
         let mut page = match cursor {
             Some(c) => self.rpc("files/list_folder/continue", &json!({ "cursor": c }))?,
             None => self.rpc(
@@ -320,19 +260,14 @@ impl Dropbox {
 }
 
 impl Source for Dropbox {
-    fn resources(&self, asset: &Asset, _local_id: &str) -> Result<Vec<Resource>> {
-        Ok(vec![Resource {
-            index: 0,
-            kind: Kind::Original,
-            filename: asset.filename.clone(),
-        }])
-    }
-
     fn write(&self, local_id: &str, _index: usize, dest: &Path) -> Result<String> {
         let url = format!("{CONTENT}/files/download");
         let arg = json!({ "path": local_id }).to_string();
-        let resp = self.send("files/download", || {
-            self.client.post(&url).header("Dropbox-API-Arg", &arg)
+        let resp = self.session.send("files/download", || {
+            self.session
+                .client
+                .post(&url)
+                .header("Dropbox-API-Arg", &arg)
         })?;
         write_hashed(resp, dest)
     }

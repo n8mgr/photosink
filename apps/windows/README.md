@@ -1,7 +1,8 @@
 # Photosink for Windows
 
-WinUI 3 front end over the `photosink-bridge` crate. All behaviour lives in
-the bridge; this app only renders what `Core` returns.
+WinUI 3 front end over the `photosink-bridge` crate. Behaviour lives in the
+bridge, which returns typed data; this app owns the presentation: every label,
+message and number or date format is built here (`Copy.cs`).
 
 ## Prerequisites
 

@@ -1,19 +1,23 @@
 //! Writes the XMP packet produced by [`super::xmp::write`] into the media file
 //! itself, in the container's native slot: an APP1 segment for JPEG, an `iTXt`
 //! chunk for PNG, IFD0 tag 700 for TIFF-based RAW and DNG, a `mime` item for
-//! HEIC/HEIF, and a top-level `uuid` box for MOV, MP4 and CR3. Existing packets
-//! are compared first and rewritten in place when the new one fits.
+//! HEIC/HEIF, and a top-level `uuid` box for MOV, MP4 and CR3. An identical
+//! existing packet leaves the file untouched. JPEG and PNG are always rewritten
+//! whole through a temporary file. TIFF, HEIF and `uuid` boxes overwrite the
+//! existing packet in place when the new one fits; otherwise TIFF and `uuid`
+//! append to the file in place, and HEIF is rewritten through a temporary file.
 
 mod isobmff;
 mod jpeg;
 mod png;
 mod tiff;
 
-pub use isobmff::creation_time;
+pub(super) use isobmff::creation_time;
 
 use anyhow::Result;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::Path;
 
 const PAD: usize = 2048;
@@ -79,17 +83,26 @@ fn write_at(f: &mut File, pos: u64, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Writes `data` to a temporary file beside `path` and renames it into place.
-fn replace_file(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = tmp_path(path);
-    std::fs::write(&tmp, data)?;
+/// Writes a temporary file beside `path` with `write` and renames it into place.
+fn replace_with(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.embed"));
+    let written = File::create(&tmp)
+        .map_err(anyhow::Error::from)
+        .and_then(|mut f| write(&mut f));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn tmp_path(path: &Path) -> std::path::PathBuf {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    path.with_file_name(format!(".{name}.embed"))
+/// Replaces `range` of the file's bytes `data` with `block` and writes the
+/// result over `path`.
+fn splice_file(path: &Path, mut data: Vec<u8>, range: Range<usize>, block: Vec<u8>) -> Result<()> {
+    data.splice(range, block);
+    replace_with(path, |f| Ok(f.write_all(&data)?))
 }
 
 #[derive(Clone, Copy)]

@@ -36,22 +36,26 @@ public sealed partial class RowView : Grid
         SetColumnSpan(body, asset ? 1 : 2);
     }
 
-    private void Header(Row row, Action<string> open)
+    private void ShowRun(Row.Run row, Action<string> open)
     {
         Indent(false);
-        body.Children.Add(Ui.Text(row.Title, "StrongText"));
-        var facts = new WrapPanel { HorizontalSpacing = 14 };
-        foreach (var f in row.Facts)
+        if (row.Title is { } title)
         {
+            body.Children.Add(Ui.Text(Copy.RunTitleText(title), "StrongText"));
+        }
+        var facts = new WrapPanel { HorizontalSpacing = 14 };
+        foreach (var fact in row.Facts)
+        {
+            var (value, label, tooltip) = Copy.FactParts(fact);
             var t = new TextBlock { Style = Ui.Style("SecondaryText") };
-            if (f.Value.Length > 0)
+            if (value is not null)
             {
-                t.Inlines.Add(new Run { Text = f.Value + " ", FontWeight = FontWeights.SemiBold });
+                t.Inlines.Add(new Run { Text = value + " ", FontWeight = FontWeights.SemiBold });
             }
-            t.Inlines.Add(new Run { Text = f.Label });
-            if (f.Tooltip.Length > 0)
+            t.Inlines.Add(new Run { Text = label });
+            if (tooltip is not null)
             {
-                ToolTipService.SetToolTip(t, f.Tooltip);
+                ToolTipService.SetToolTip(t, tooltip);
             }
             facts.Children.Add(t);
         }
@@ -69,52 +73,62 @@ public sealed partial class RowView : Grid
         }
     }
 
-    private void Asset(Row row)
+    private void ShowAsset(Row.Asset row)
     {
         Indent(true);
-        position.Text = row.Position + row.Of;
-        body.Children.Add(Ui.Text(row.Title, row.Failed ? "CriticalText" : "PlainText"));
-        foreach (var d in row.Details)
+        position.Text = row.Position is { } p ? $"{Copy.Count(p.N)}/{Copy.Count(p.Total)}" : "";
+        body.Children.Add(Ui.Text(row.Name ?? "…", row.Failed ? "CriticalText" : "PlainText"));
+        foreach (var detail in row.Details)
         {
-            var (prefix, style) = d.Kind switch
+            switch (detail)
             {
-                DetailKind.New => ("→ ", "PlainText"),
-                DetailKind.Duplicate => ("= ", "SecondaryText"),
-                DetailKind.Metadata => ("xmp ", "SecondaryText"),
-                DetailKind.Error => ("", "CriticalText"),
-                _ => ("", "SecondaryText"),
-            };
-            body.Children.Add(Ui.Text(prefix + d.Text, style));
+                case Detail.Placed d:
+                    body.Children.Add(Ui.Text("→ " + d.Path, "PlainText"));
+                    break;
+                case Detail.Duplicate d:
+                    body.Children.Add(Ui.Text("= " + d.Existing, "SecondaryText"));
+                    break;
+                case Detail.Metadata d:
+                    body.Children.Add(Ui.Text("xmp " + d.Path, "SecondaryText"));
+                    break;
+                case Detail.Redated d:
+                    body.Children.Add(Ui.Text(d.From is { } before ? Copy.Date(before) : "none", "SecondaryText"));
+                    body.Children.Add(Ui.Text("→ " + Copy.Date(d.To), "PlainText"));
+                    break;
+                case Detail.Error d:
+                    body.Children.Add(Ui.Text(Copy.WithSubject(d.Subject, d.Message), "CriticalText"));
+                    break;
+                case Detail.NothingNew:
+                    body.Children.Add(Ui.Text("nothing new", "SecondaryText"));
+                    break;
+            }
         }
     }
 
-    private void Clean(Row row)
+    private void ShowClean(Row.Clean row)
     {
         Indent(true);
-        position.Text = row.Tag;
-        body.Children.Add(Ui.Text(row.Title, row.Failed ? "CriticalText" : "PlainText"));
-        foreach (var d in row.Details)
-        {
-            body.Children.Add(Ui.Text(d.Text, d.Kind switch
-            {
-                DetailKind.New => "PlainText",
-                DetailKind.Error => "CriticalText",
-                _ => "SecondaryText",
-            }));
-        }
+        position.Text = Copy.ReasonLabel(row.Reason);
+        body.Children.Add(Ui.Text(row.Path, row.Failed ? "CriticalText" : "PlainText"));
+        body.Children.Add(Ui.Text(Copy.OutcomeLabel(row.Outcome), row.Outcome == CleanOutcome.Removed ? "PlainText" : "SecondaryText"));
     }
 
-    private void SignIn(Row row)
+    private void ShowSignIn(Row.SignIn row)
     {
         Indent(false);
-        body.Children.Add(Ui.Text(row.Tag, "SecondaryText"));
-        if (row.Title.Length > 0)
+        switch (row.Prompt)
         {
-            var code = Ui.Text(row.Title, "PlainText");
-            code.FontFamily = Ui.Mono;
-            code.FontSize = 28;
-            code.IsTextSelectionEnabled = true;
-            body.Children.Add(code);
+            case SignIn.DeviceCode device:
+                body.Children.Add(Ui.Text("Sign in with code", "SecondaryText"));
+                var code = Ui.Text(device.Code, "PlainText");
+                code.FontFamily = Ui.Mono;
+                code.FontSize = 28;
+                code.IsTextSelectionEnabled = true;
+                body.Children.Add(code);
+                break;
+            default:
+                body.Children.Add(Ui.Text("Approve access in your browser", "SecondaryText"));
+                break;
         }
         if (Uri.TryCreate(row.Url, UriKind.Absolute, out var uri))
         {
@@ -122,33 +136,34 @@ public sealed partial class RowView : Grid
         }
     }
 
+    private void ShowError(Row.Error row)
+    {
+        Indent(false);
+        var error = Ui.Text(Copy.WithSubject(row.Subject, row.Message), "CriticalText");
+        error.IsTextSelectionEnabled = true;
+        body.Children.Add(error);
+    }
+
     internal void Show(Row? row, Action<string> open)
     {
         body.Children.Clear();
         position.Text = "";
-        if (row is null)
+        switch (row)
         {
-            return;
-        }
-        switch (row.Kind)
-        {
-            case RowKind.Run:
-                Header(row, open);
+            case Row.Run run:
+                ShowRun(run, open);
                 break;
-            case RowKind.Asset:
-                Asset(row);
+            case Row.Asset asset:
+                ShowAsset(asset);
                 break;
-            case RowKind.Clean:
-                Clean(row);
+            case Row.Clean clean:
+                ShowClean(clean);
                 break;
-            case RowKind.SignIn:
-                SignIn(row);
+            case Row.SignIn signIn:
+                ShowSignIn(signIn);
                 break;
-            default:
-                Indent(false);
-                var error = Ui.Text(row.Title, "CriticalText");
-                error.IsTextSelectionEnabled = true;
-                body.Children.Add(error);
+            case Row.Error error:
+                ShowError(error);
                 break;
         }
     }

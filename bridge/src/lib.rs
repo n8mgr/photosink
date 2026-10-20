@@ -7,11 +7,13 @@ pub mod dates;
 pub mod grid;
 pub mod settings;
 
-use catalog::{Confirmation, Group, RunArgs, Tab};
+use catalog::{Blocker, Confirmation, RunArgs, RunTitle, Tab};
 use dates::{DateKey, DateRow, Dates, DatesView};
 use grid::{Chip, Grid, Row, RowState};
+use photosink::photo::Asset;
+use photosink::redate::Choice;
 use photosink::{App, Event, config};
-use settings::{FieldGroup, Insertion, Options, Preview, Settings, Summaries, TemplateKind};
+use settings::{Field, Preview, Settings, SettingsProblem};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -22,15 +24,28 @@ uniffi::setup_scaffolding!();
 const TICK: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-#[uniffi(flat_error)]
 pub enum CoreError {
-    #[error("{0}")]
-    Failed(String),
+    /// A run can't start; see `Core::blocker`.
+    #[error("blocked: {blocker:?}")]
+    Blocked { blocker: Blocker },
+    /// A run is already going on `tab`.
+    #[error("{tab:?} is running")]
+    Running { tab: Tab },
+    /// `apply_dates` with no date chosen.
+    #[error("nothing chosen")]
+    NothingChosen,
+    #[error("invalid settings: {problem:?}")]
+    InvalidSettings { problem: SettingsProblem },
+    /// Anything else, with the core's own message.
+    #[error("{detail}")]
+    Failed { detail: String },
 }
 
 impl From<anyhow::Error> for CoreError {
     fn from(e: anyhow::Error) -> Self {
-        CoreError::Failed(format!("{e:#}"))
+        CoreError::Failed {
+            detail: format!("{e:#}"),
+        }
     }
 }
 
@@ -51,17 +66,55 @@ pub trait Listener: Send + Sync {
     fn changed(&self, change: Change);
 }
 
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct Status {
-    pub text: String,
-    pub error: bool,
-    pub running: Option<Tab>,
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum Status {
+    Idle,
+    /// A run started on `tab`.
+    Running {
+        tab: Tab,
+    },
+    /// The scan Dates runs again after applying.
+    CheckingDates,
+    ApplyingDates,
+    /// The last run finished; `errors` rows failed.
+    Done {
+        errors: u32,
+    },
+    /// The last run failed outright; its error is the tab's last row.
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StatKind {
+    Exported,
+    /// Exported in a dry run.
+    Planned,
+    Duplicates,
+    Skipped,
+    Filtered,
+    Errors,
+    Moved,
+    /// Moved in a dry run.
+    WouldMove,
+    Renamed,
+    Unchanged,
+    NoMetadata,
+    RowsChecked,
+    DeadRows,
+    AssetsReset,
+    SidecarsRemoved,
+    /// Sidecars removed in a dry run.
+    SidecarsToRemove,
+    UnreferencedFiles,
+    FilesRemoved,
+    /// Files removed in a dry run.
+    FilesToRemove,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Stat {
-    pub label: String,
-    pub value: String,
+    pub kind: StatKind,
+    pub count: u64,
 }
 
 struct Model {
@@ -70,7 +123,16 @@ struct Model {
     args: HashMap<Tab, RunArgs>,
     dates: Dates,
     status: Status,
+    running: Option<Tab>,
     settings: Option<Settings>,
+    dropbox_key: bool,
+    /// The asset templates are previewed against, for the export folder it was read from.
+    sample: Option<(String, Option<(Asset, String)>)>,
+}
+
+enum Job {
+    Run,
+    ApplyDates(Vec<Choice>),
 }
 
 struct Shared {
@@ -88,19 +150,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn stats<T: Into<Vec<(&'static str, usize)>>>(pairs: T) -> Vec<Stat> {
+fn stats<T: Into<Vec<(StatKind, usize)>>>(pairs: T) -> Vec<Stat> {
     pairs
         .into()
         .into_iter()
-        .map(|(label, v)| Stat {
-            label: label.into(),
-            value: v.to_string(),
+        .map(|(kind, v)| Stat {
+            kind,
+            count: v as u64,
         })
         .collect()
 }
 
 fn config_file() -> anyhow::Result<std::path::PathBuf> {
-    let path = photosink::config_path(None)?;
+    let path = photosink::config_path()?;
     if !path.exists() {
         config::write_initial(&path)?;
     }
@@ -112,18 +174,13 @@ impl Shared {
         lock(&self.dirty).insert(change);
     }
 
-    fn set_status(
-        &self,
-        m: &mut Model,
-        text: impl Into<String>,
-        error: bool,
-        running: Option<Tab>,
-    ) {
-        m.status = Status {
-            text: text.into(),
-            error,
-            running,
+    fn set_status(&self, m: &mut Model, status: Status) {
+        m.running = match status {
+            Status::Running { tab } => Some(tab),
+            Status::CheckingDates | Status::ApplyingDates => Some(Tab::Dates),
+            Status::Idle | Status::Done { .. } | Status::Failed => None,
         };
+        m.status = status;
         self.mark(Change::Status);
     }
 
@@ -132,11 +189,11 @@ impl Shared {
         let mut m = lock(&self.model);
         match e {
             Event::Checking { total, .. } => {
-                m.dates.checking(total);
+                m.dates.checked(0, total);
                 self.mark(Change::Dates);
             }
-            Event::Checked { n, total, flagged } => {
-                m.dates.checked(n, total, flagged);
+            Event::Checked { n, total, .. } => {
+                m.dates.checked(n, total);
                 self.mark(Change::Dates);
             }
             Event::Flagged(c) => {
@@ -150,18 +207,15 @@ impl Shared {
         }
     }
 
-    fn run(self: &Arc<Self>, tab: Tab, args: RunArgs, choices: Vec<photosink::redate::Choice>) {
-        let app = match App::open(None, None) {
+    fn run(self: &Arc<Self>, tab: Tab, args: RunArgs, job: Job) {
+        let applying = matches!(job, Job::ApplyDates(_));
+        let app = match App::open() {
             Ok(app) => app,
-            Err(e) => return self.finish(tab, Err(e), Vec::new()),
+            Err(e) => return self.finish(tab, Err(e), applying),
         };
-        let log = match app.run_log(if choices.is_empty() {
-            tab.slug()
-        } else {
-            "dates-apply"
-        }) {
+        let log = match app.run_log(if applying { "dates-apply" } else { tab.slug() }) {
             Ok(log) => log,
-            Err(e) => return self.finish(tab, Err(e), Vec::new()),
+            Err(e) => return self.finish(tab, Err(e), applying),
         };
         let first = Event::Log {
             path: log.path.display().to_string(),
@@ -173,64 +227,65 @@ impl Shared {
             self.event(tab, e);
         };
         let dry = args.dry;
-        let result: anyhow::Result<Vec<Stat>> = match tab {
-            #[cfg(target_os = "macos")]
-            Tab::ApplePhotos => app
-                .apple_photos(Path::new(&args.arg), &progress, dry)
-                .map(|s| summary(&s, dry)),
-            #[cfg(not(target_os = "macos"))]
-            Tab::ApplePhotos => Err(anyhow::anyhow!("Apple Photos is only available on macOS")),
-            Tab::OneDrive => app
-                .onedrive(args.arg.trim(), &progress, dry)
-                .map(|s| summary(&s, dry)),
-            Tab::Dropbox => app
-                .dropbox(args.arg.trim(), &progress, dry)
-                .map(|s| summary(&s, dry)),
-            Tab::GoogleTakeout => app
-                .takeout(Path::new(args.arg.trim()), &progress, dry)
-                .map(|s| summary(&s, dry)),
-            Tab::Consolidate => app
-                .consolidate(&progress, dry)
-                .map(|c| consolidated(&c, dry)),
-            Tab::Clean => app.clean(args.option, dry, &progress).map(|c| {
-                let mut out = vec![
-                    ("rows checked", c.rows),
-                    ("dead rows", c.dead_rows),
-                    ("assets reset", c.removed_assets),
-                    (
-                        if dry {
-                            "sidecars to remove"
-                        } else {
-                            "sidecars removed"
-                        },
-                        c.removed_sidecars,
-                    ),
-                    ("unreferenced files", c.orphan_files),
-                ];
-                if args.option {
-                    out.push((
-                        if dry {
-                            "files to remove"
-                        } else {
-                            "files removed"
-                        },
-                        c.removed_files,
-                    ));
-                }
-                stats(out)
-            }),
-            Tab::Dates if !choices.is_empty() => app
+        let result: anyhow::Result<Vec<Stat>> = match job {
+            Job::ApplyDates(choices) => app
                 .redate_apply(&choices, &progress)
                 .map(|c| consolidated(&c, false)),
-            Tab::Dates => {
-                let q = args.arg.trim();
-                app.redate_scan((!q.is_empty()).then_some(q), &progress)
-                    .map(|_| Vec::new())
-            }
+            Job::Run => match tab {
+                #[cfg(target_os = "macos")]
+                Tab::ApplePhotos => app
+                    .apple_photos(Path::new(&args.arg), &progress, dry)
+                    .map(|s| summary(&s, dry)),
+                #[cfg(not(target_os = "macos"))]
+                Tab::ApplePhotos => unreachable!("start() returns Blocker::Unavailable"),
+                Tab::OneDrive => app
+                    .onedrive(args.arg.trim(), &progress, dry)
+                    .map(|s| summary(&s, dry)),
+                Tab::Dropbox => app
+                    .dropbox(args.arg.trim(), &progress, dry)
+                    .map(|s| summary(&s, dry)),
+                Tab::GoogleTakeout => app
+                    .takeout(Path::new(args.arg.trim()), &progress, dry)
+                    .map(|s| summary(&s, dry)),
+                Tab::Consolidate => app
+                    .consolidate(&progress, dry)
+                    .map(|c| consolidated(&c, dry)),
+                Tab::Clean => app.clean(args.option, &progress, dry).map(|c| {
+                    let mut out = vec![
+                        (StatKind::RowsChecked, c.rows),
+                        (StatKind::DeadRows, c.dead_rows),
+                        (StatKind::AssetsReset, c.removed_assets),
+                        (
+                            if dry {
+                                StatKind::SidecarsToRemove
+                            } else {
+                                StatKind::SidecarsRemoved
+                            },
+                            c.removed_sidecars,
+                        ),
+                        (StatKind::UnreferencedFiles, c.orphan_files),
+                    ];
+                    if args.option {
+                        out.push((
+                            if dry {
+                                StatKind::FilesToRemove
+                            } else {
+                                StatKind::FilesRemoved
+                            },
+                            c.removed_files,
+                        ));
+                    }
+                    stats(out)
+                }),
+                Tab::Dates => {
+                    let q = args.arg.trim();
+                    app.redate_scan((!q.is_empty()).then_some(q), &progress)
+                        .map(|()| Vec::new())
+                }
+            },
         };
-        let applied = !choices.is_empty();
-        self.finish(tab, result, choices);
-        if applied {
+        self.finish(tab, result, applying);
+        if applying {
             let failed = lock(&self.model)
                 .grids
                 .get(&Tab::Dates)
@@ -242,33 +297,25 @@ impl Shared {
         }
     }
 
-    fn finish(
-        &self,
-        tab: Tab,
-        result: anyhow::Result<Vec<Stat>>,
-        applied: Vec<photosink::redate::Choice>,
-    ) {
+    /// Ends a run on `tab`; `applied` when it applied dates rather than scanning.
+    fn finish(&self, tab: Tab, result: anyhow::Result<Vec<Stat>>, applied: bool) {
         let mut m = lock(&self.model);
+        m.sample = None;
         if tab == Tab::Dates {
-            m.dates.scanning = false;
-            m.dates.applying = false;
+            m.dates.finish();
             self.mark(Change::Dates);
         }
         match result {
             Ok(stats) => {
-                if !(tab == Tab::Dates && applied.is_empty()) {
+                if tab != Tab::Dates || applied {
                     m.stats.insert(tab, stats);
                 }
-                let failed = m.grids.get(&tab).map_or(0, Grid::errors);
-                if failed > 0 {
-                    self.set_status(&mut m, format!("Done with {failed} errors"), true, None);
-                } else {
-                    self.set_status(&mut m, "Done", false, None);
-                }
+                let errors = m.grids.get(&tab).map_or(0, Grid::errors) as u32;
+                self.set_status(&mut m, Status::Done { errors });
             }
             Err(e) => {
                 m.grids.entry(tab).or_default().push_error(format!("{e:#}"));
-                self.set_status(&mut m, "Failed", true, None);
+                self.set_status(&mut m, Status::Failed);
             }
         }
         self.mark(Change::Grid { tab });
@@ -280,11 +327,11 @@ impl Shared {
             let title = Tab::Dates.run_title(&args, "");
             m.grids.entry(Tab::Dates).or_default().start_run(title);
             m.dates.start_scan(!args.arg.trim().is_empty());
-            self.set_status(&mut m, "Checking dates…", false, Some(Tab::Dates));
+            self.set_status(&mut m, Status::CheckingDates);
             self.mark(Change::Grid { tab: Tab::Dates });
             self.mark(Change::Dates);
         }
-        self.run(Tab::Dates, args, Vec::new());
+        self.run(Tab::Dates, args, Job::Run);
     }
 
     fn spawn_ticker(this: &Arc<Shared>) {
@@ -304,20 +351,34 @@ impl Shared {
 
 fn summary(s: &photosink::export::Summary, dry: bool) -> Vec<Stat> {
     stats([
-        (if dry { "planned" } else { "exported" }, s.exported),
-        ("duplicates", s.duplicates),
-        ("skipped", s.skipped),
-        ("filtered", s.filtered),
-        ("errors", s.errors),
+        (
+            if dry {
+                StatKind::Planned
+            } else {
+                StatKind::Exported
+            },
+            s.exported,
+        ),
+        (StatKind::Duplicates, s.duplicates),
+        (StatKind::Skipped, s.skipped),
+        (StatKind::Filtered, s.filtered),
+        (StatKind::Errors, s.errors),
     ])
 }
 
 fn consolidated(c: &photosink::consolidate::Consolidated, dry: bool) -> Vec<Stat> {
     stats([
-        (if dry { "would move" } else { "moved" }, c.moved),
-        ("renamed", c.restemmed),
-        ("unchanged", c.unchanged),
-        ("no metadata", c.missing),
+        (
+            if dry {
+                StatKind::WouldMove
+            } else {
+                StatKind::Moved
+            },
+            c.moved,
+        ),
+        (StatKind::Renamed, c.restemmed),
+        (StatKind::Unchanged, c.unchanged),
+        (StatKind::NoMetadata, c.missing),
     ])
 }
 
@@ -330,11 +391,26 @@ impl Core {
         f(self.model().grids.entry(tab).or_default())
     }
 
-    fn export_dir(&self) -> String {
-        let known = self.model().settings.as_ref().map(|s| s.export_dir.clone());
-        known
-            .or_else(|| self.settings().ok().map(|s| s.export_dir))
-            .unwrap_or_default()
+    /// Loads the settings into the model unless they already are.
+    fn loaded(&self) -> MutexGuard<'_, Model> {
+        if self.model().settings.is_none() {
+            let _ = self.settings();
+        }
+        self.model()
+    }
+
+    /// The first exported asset under `export_dir`, read once per folder.
+    fn sample(&self, export_dir: &str) -> Option<(Asset, String)> {
+        if let Some((dir, sample)) = &self.model().sample
+            && dir == export_dir
+        {
+            return sample.clone();
+        }
+        let sample = App::open()
+            .ok()
+            .and_then(|app| app.first_exported(Path::new(export_dir)).ok().flatten());
+        self.model().sample = Some((export_dir.to_owned(), sample.clone()));
+        sample
     }
 }
 
@@ -346,17 +422,16 @@ impl Core {
             model: Mutex::new(Model {
                 grids: HashMap::new(),
                 stats: HashMap::new(),
-                args: Tab::all()
+                args: catalog::tabs()
                     .into_iter()
                     .map(|t| (t, t.default_args()))
                     .collect(),
                 dates: Dates::default(),
-                status: Status {
-                    text: "Idle".into(),
-                    error: false,
-                    running: None,
-                },
+                status: Status::Idle,
+                running: None,
                 settings: None,
+                dropbox_key: false,
+                sample: None,
             }),
             dirty: Mutex::new(HashSet::new()),
             listener,
@@ -365,22 +440,22 @@ impl Core {
         Arc::new(Core { shared })
     }
 
-    pub fn groups(&self) -> Vec<Group> {
-        catalog::groups()
+    /// Every tab available on this platform, in sidebar order.
+    pub fn tabs(&self) -> Vec<Tab> {
+        catalog::tabs()
     }
 
-    pub fn options(&self) -> Options {
-        settings::options()
-    }
-
-    pub fn fields(&self) -> Vec<FieldGroup> {
+    /// Template fields, grouped in order.
+    pub fn fields(&self) -> Vec<Field> {
         settings::fields()
     }
 
     pub fn settings(&self) -> Result<Settings, CoreError> {
         let cfg = config::Config::load(&config_file()?)?;
         let s = Settings::from_config(&cfg);
-        self.model().settings = Some(s.clone());
+        let mut m = self.model();
+        m.settings = Some(s.clone());
+        m.dropbox_key = !cfg.dropbox_app_key.trim().is_empty();
         Ok(s)
     }
 
@@ -391,29 +466,11 @@ impl Core {
         Ok(())
     }
 
-    pub fn summaries(&self, settings: Settings) -> Summaries {
-        settings.summaries()
-    }
-
-    pub fn preview(&self, settings: Settings, kind: TemplateKind) -> Preview {
-        settings::preview(
-            &settings.export_dir,
-            &settings.path,
-            &settings.filename,
-            kind,
-        )
-    }
-
-    /// Inserts `token` over the selection `start..end`, in UTF-16 code units.
-    pub fn insert_field(
-        &self,
-        text: String,
-        start: u32,
-        end: u32,
-        token: String,
-        kind: TemplateKind,
-    ) -> Insertion {
-        settings::insert_field(&text, start, end, &token, kind)
+    /// Renders both templates of `settings` against the first asset exported
+    /// to its folder, or a sample.
+    pub fn preview(&self, settings: Settings) -> Preview {
+        let sample = self.sample(&settings.export_dir);
+        settings::preview(&settings, sample.as_ref())
     }
 
     pub fn run_args(&self, tab: Tab) -> RunArgs {
@@ -429,32 +486,23 @@ impl Core {
         self.shared.mark(Change::Status);
     }
 
-    pub fn run_label(&self, tab: Tab) -> String {
-        tab.run_label(&self.run_args(tab))
-    }
-
     /// Why `tab` can't run yet, or None when it can.
-    pub fn blocker(&self, tab: Tab) -> Option<String> {
-        if let Some(running) = self.model().status.running {
-            return Some(format!("{} is running.", running.name()));
+    pub fn blocker(&self, tab: Tab) -> Option<Blocker> {
+        let args = self.run_args(tab);
+        let m = self.loaded();
+        if let Some(running) = m.running {
+            return Some(Blocker::Running { tab: running });
         }
-        if let Some(why) = tab.blocker(&self.run_args(tab), &self.export_dir()) {
+        let export_dir = m.settings.as_ref().map_or("", |s| s.export_dir.as_str());
+        if let Some(why) = tab.blocker(&args, export_dir) {
             return Some(why);
         }
-        if tab == Tab::Dropbox {
-            let key = config_file()
-                .and_then(|p| config::Config::load(&p))
-                .ok()
-                .and_then(|c| c.dropbox_app_key)
-                .filter(|k| !k.trim().is_empty());
-            if key.is_none() {
-                return Some(format!(
-                    "Set dropbox_app_key in {} to your Dropbox app's key.",
-                    photosink::config_path(None)
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                ));
-            }
+        if tab == Tab::Dropbox && !m.dropbox_key {
+            return Some(Blocker::DropboxKeyMissing {
+                config_path: photosink::config_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            });
         }
         None
     }
@@ -466,8 +514,8 @@ impl Core {
 
     /// Starts a run on `tab` with its stored args, replacing the tab's rows.
     pub fn start(&self, tab: Tab) -> Result<(), CoreError> {
-        if let Some(why) = self.blocker(tab) {
-            return Err(CoreError::Failed(why));
+        if let Some(blocker) = self.blocker(tab) {
+            return Err(CoreError::Blocked { blocker });
         }
         let args = self.run_args(tab);
         let template = self
@@ -486,46 +534,50 @@ impl Core {
                 m.dates.start_scan(!args.arg.trim().is_empty());
                 self.shared.mark(Change::Dates);
             }
-            self.shared
-                .set_status(&mut m, format!("Running {}…", tab.name()), false, Some(tab));
+            self.shared.set_status(&mut m, Status::Running { tab });
             self.shared.mark(Change::Grid { tab });
         }
         let shared = self.shared.clone();
-        std::thread::spawn(move || shared.run(tab, args, Vec::new()));
+        std::thread::spawn(move || shared.run(tab, args, Job::Run));
         Ok(())
     }
 
     /// Applies the chosen dates, then scans again unless something failed.
     pub fn apply_dates(&self) -> Result<(), CoreError> {
-        if let Some(running) = self.model().status.running {
-            return Err(CoreError::Failed(format!("{} is running.", running.name())));
+        if let Some(tab) = self.model().running {
+            return Err(CoreError::Running { tab });
         }
         let args = self.run_args(Tab::Dates);
         let choices = {
             let mut m = self.model();
             let choices = m.dates.take_choices();
             if choices.is_empty() {
-                return Err(CoreError::Failed("Nothing chosen.".into()));
+                return Err(CoreError::NothingChosen);
             }
-            m.dates.shown = false;
-            m.dates.applying = true;
+            m.dates.start_apply();
             m.stats.remove(&Tab::Dates);
             let grid = m.grids.entry(Tab::Dates).or_default();
             grid.clear();
-            grid.start_run(format!("redate {} assets", choices.len()));
-            self.shared
-                .set_status(&mut m, "Applying dates…", false, Some(Tab::Dates));
+            grid.start_run(RunTitle::Redate {
+                count: choices.len() as u32,
+            });
+            self.shared.set_status(&mut m, Status::ApplyingDates);
             self.shared.mark(Change::Grid { tab: Tab::Dates });
             self.shared.mark(Change::Dates);
             choices
         };
         let shared = self.shared.clone();
-        std::thread::spawn(move || shared.run(Tab::Dates, args, choices));
+        std::thread::spawn(move || shared.run(Tab::Dates, args, Job::ApplyDates(choices)));
         Ok(())
     }
 
     pub fn status(&self) -> Status {
         self.model().status.clone()
+    }
+
+    /// The tab a run is going on, if any; tabs can't be switched meanwhile.
+    pub fn running(&self) -> Option<Tab> {
+        self.model().running
     }
 
     pub fn stats(&self, tab: Tab) -> Vec<Stat> {
@@ -561,7 +613,7 @@ impl Core {
 
     pub fn clear(&self, tab: Tab) {
         let mut m = self.model();
-        if m.status.running == Some(tab) {
+        if m.running == Some(tab) {
             return;
         }
         m.grids.entry(tab).or_default().clear();
@@ -571,8 +623,7 @@ impl Core {
 
     pub fn dates_view(&self) -> DatesView {
         let m = self.model();
-        m.dates
-            .view(m.status.running.is_some() && !m.dates.scanning)
+        m.dates.view(m.running.is_some() && !m.dates.scanning())
     }
 
     pub fn dates_len(&self) -> u32 {
@@ -588,11 +639,11 @@ impl Core {
         self.shared.mark(Change::Dates);
     }
 
-    /// Chooses a typed date. Returns why it isn't one, if it isn't.
-    pub fn dates_manual(&self, uuid: String, text: String) -> Option<String> {
-        let out = self.model().dates.manual(&uuid, &text);
+    /// Chooses the user's own date for `uuid`, or drops it with None. `at`
+    /// follows the timestamp convention in `dates`.
+    pub fn dates_manual(&self, uuid: String, at: Option<i64>) {
+        self.model().dates.manual(&uuid, at);
         self.shared.mark(Change::Dates);
-        out
     }
 
     pub fn dates_pick_all(&self, key: DateKey) {
@@ -603,11 +654,6 @@ impl Core {
     pub fn dates_clear(&self) {
         self.model().dates.clear_choices();
         self.shared.mark(Change::Dates);
-    }
-
-    /// Opens a file or folder with the system's default app.
-    pub fn open_path(&self, path: String) -> Result<(), CoreError> {
-        open::that_detached(&path).map_err(|e| CoreError::Failed(format!("{path}: {e}")))
     }
 }
 
@@ -663,10 +709,17 @@ mod tests {
     #[test]
     fn blocks_runs_without_an_export_folder() {
         let core = Core::new(Arc::new(Recorder(Mutex::new(Vec::new()))));
-        let mut s = Settings::from_config(&config::Config::parse("export_dir = \"\"").unwrap());
-        s.export_dir = String::new();
+        let s = Settings::from_config(&config::Config::parse("export_dir = \"\"").unwrap());
         core.model().settings = Some(s);
-        assert!(core.blocker(Tab::Consolidate).is_some());
-        assert!(core.start(Tab::Consolidate).is_err());
+        assert_eq!(
+            core.blocker(Tab::Consolidate),
+            Some(Blocker::NoExportFolder)
+        );
+        assert!(matches!(
+            core.start(Tab::Consolidate),
+            Err(CoreError::Blocked {
+                blocker: Blocker::NoExportFolder
+            })
+        ));
     }
 }

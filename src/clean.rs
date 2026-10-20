@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone)]
 pub struct Cleaned {
     pub rows: usize,
     pub dead_rows: usize,
@@ -19,8 +19,7 @@ pub struct Cleaned {
     pub removed_files: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// A state row whose file is not on disk.
     Missing,
@@ -84,8 +83,8 @@ pub fn run(
     cfg: &Config,
     state: &State,
     orphans: bool,
-    dry: bool,
     progress: Progress,
+    dry: bool,
 ) -> Result<Cleaned> {
     let mut out = Cleaned::default();
     let mut files = Vec::new();
@@ -113,14 +112,12 @@ pub fn run(
         }
     }
 
-    // Rows whose file is gone. An asset with none left also loses its sidecar
-    // and its folder claim, so the next run exports it afresh.
     let mut seen = HashSet::new();
     let mut handled: HashSet<PathBuf> = HashSet::new();
     for row in dead {
         out.dead_rows += 1;
         if !dry {
-            state.forget_export(&row.uuid, &row.kind)?;
+            state.forget_export(&row.uuid, row.kind)?;
         }
         progress(Event::Clean {
             path: rel(cfg, Path::new(&row.path)),
@@ -149,7 +146,6 @@ pub fn run(
         }
     }
 
-    // Sidecars that no asset claims.
     for p in &sidecars {
         let dir = p
             .parent()
@@ -171,7 +167,6 @@ pub fn run(
         }
     }
 
-    // Media files the state does not reference.
     for p in &media {
         if referenced.contains(p) {
             continue;
@@ -195,6 +190,7 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::photo::Asset;
+    use crate::sources::Kind;
 
     fn seed(state: &State, dir: &Path, uuid: &str, stem: &str, name: &str, bytes: &[u8]) -> String {
         std::fs::create_dir_all(dir).unwrap();
@@ -205,7 +201,7 @@ mod tests {
             .unwrap();
         let hash = blake3::hash(bytes).to_hex().to_string();
         state
-            .record(uuid, "original", &hash, &path.to_string_lossy())
+            .record(uuid, Kind::Original, &hash, &path.to_string_lossy())
             .unwrap();
         let asset = Asset {
             uuid: uuid.into(),
@@ -235,7 +231,7 @@ mod tests {
         state
             .record(
                 "D",
-                "original",
+                Kind::Original,
                 "h",
                 &out_dir.join("2019-05-03/IMG_1.HEIC").to_string_lossy(),
             )
@@ -243,7 +239,7 @@ mod tests {
         std::fs::write(a.join("stray.PNG"), b"stray").unwrap();
         std::fs::write(a.join("lonely.xmp"), b"<x/>").unwrap();
 
-        let c = run(&cfg, &state, false, true, &|e| eprintln!("{e}")).unwrap();
+        let c = run(&cfg, &state, false, &|e| eprintln!("{e}"), true).unwrap();
         assert_eq!(
             (
                 c.dead_rows,
@@ -258,9 +254,9 @@ mod tests {
             a.join("IMG_2.xmp").exists() && a.join("stray.PNG").exists(),
             "dry run deletes nothing"
         );
-        assert!(state.exported("B", "original").unwrap().is_some());
+        assert!(state.exported("B", Kind::Original).unwrap().is_some());
 
-        let c = run(&cfg, &state, false, false, &|e| eprintln!("{e}")).unwrap();
+        let c = run(&cfg, &state, false, &|e| eprintln!("{e}"), false).unwrap();
         assert_eq!(
             (
                 c.dead_rows,
@@ -273,12 +269,12 @@ mod tests {
         );
         assert!(!a.join("IMG_2.xmp").exists() && !a.join("lonely.xmp").exists());
         assert!(a.join("stray.PNG").exists(), "orphans kept unless asked");
-        assert_eq!(state.exported("B", "original").unwrap(), None);
+        assert_eq!(state.exported("B", Kind::Original).unwrap(), None);
         assert_eq!(state.stem("B").unwrap(), None, "B can be exported again");
-        assert_eq!(state.exported("D", "original").unwrap(), None);
+        assert_eq!(state.exported("D", Kind::Original).unwrap(), None);
         assert!(a.join("IMG_1.HEIC").exists() && a.join("IMG_1.xmp").exists());
 
-        let c = run(&cfg, &state, true, false, &|e| eprintln!("{e}")).unwrap();
+        let c = run(&cfg, &state, true, &|e| eprintln!("{e}"), false).unwrap();
         assert_eq!((c.dead_rows, c.orphan_files, c.removed_files), (0, 1, 1));
         assert!(!a.join("stray.PNG").exists());
     }

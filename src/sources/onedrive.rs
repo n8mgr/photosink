@@ -1,16 +1,15 @@
-use super::{Kind, Resource, Source};
+use super::Source;
+use super::oauth::{Provider, Session, Token, now};
 use crate::Progress;
 use crate::export::write_hashed;
 use crate::photo::{Asset, Camera};
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use reqwest::blocking::{Client, Response};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::time::Duration;
 
 const AUTH: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
 const GRAPH: &str = "https://graph.microsoft.com/v1.0/me/drive";
@@ -18,25 +17,32 @@ const SCOPE: &str = "Files.Read offline_access";
 const SELECT: &str =
     "$select=id,name,file,folder,deleted,photo,location,description,fileSystemInfo,createdDateTime";
 
-#[derive(Serialize, Deserialize, Default)]
-struct Token {
-    access_token: String,
-    refresh_token: String,
-    expires_at: u64,
-}
-
-pub struct OneDrive {
-    client: Client,
+struct Microsoft {
     client_id: String,
-    token_path: PathBuf,
-    token: Mutex<Token>,
 }
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+pub(crate) struct OneDrive {
+    session: Session<Microsoft>,
+}
+
+impl Provider for Microsoft {
+    fn login(&self, client: &Client, progress: Progress) -> Result<Token> {
+        device_login(client, &self.client_id, progress)
+    }
+
+    fn refresh(&self, client: &Client, refresh_token: &str) -> Result<Token> {
+        let v: Value = client
+            .post(format!("{AUTH}/token"))
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("scope", SCOPE),
+            ])
+            .send()?
+            .json()?;
+        token_from(&v)
+    }
 }
 
 fn token_from(v: &Value) -> Result<Token> {
@@ -133,83 +139,24 @@ fn device_login(client: &Client, client_id: &str, progress: Progress) -> Result<
 }
 
 impl OneDrive {
-    pub fn connect(client_id: &str, token_path: &Path, progress: Progress) -> Result<OneDrive> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(3600))
-            .build()?;
-        let token = match std::fs::read(token_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(_) => device_login(&client, client_id, progress)?,
-        };
-        let od = OneDrive {
-            client,
+    pub(crate) fn connect(
+        client_id: &str,
+        token_path: &Path,
+        progress: Progress,
+    ) -> Result<OneDrive> {
+        let provider = Microsoft {
             client_id: client_id.to_owned(),
-            token_path: token_path.to_owned(),
-            token: Mutex::new(token),
         };
-        od.save_token()?;
-        Ok(od)
-    }
-
-    fn save_token(&self) -> Result<()> {
-        if let Some(dir) = self.token_path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(
-            &self.token_path,
-            serde_json::to_vec(&*self.token.lock().unwrap())?,
-        )?;
-        Ok(())
-    }
-
-    fn access_token(&self) -> Result<String> {
-        let refresh = {
-            let t = self.token.lock().unwrap();
-            if t.expires_at > now() + 60 {
-                return Ok(t.access_token.clone());
-            }
-            t.refresh_token.clone()
-        };
-        let v: Value = self
-            .client
-            .post(format!("{AUTH}/token"))
-            .form(&[
-                ("client_id", self.client_id.as_str()),
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &refresh),
-                ("scope", SCOPE),
-            ])
-            .send()?
-            .json()?;
-        let token = token_from(&v)?;
-        let access = token.access_token.clone();
-        *self.token.lock().unwrap() = token;
-        self.save_token()?;
-        Ok(access)
+        Ok(OneDrive {
+            session: Session::connect(provider, token_path, progress)?,
+        })
     }
 
     fn get(&self, url: &str) -> Result<Response> {
-        for _ in 0..5 {
-            let resp = self
-                .client
-                .get(url)
-                .bearer_auth(self.access_token()?)
-                .send()?;
-            if matches!(resp.status().as_u16(), 429 | 503) {
-                let wait = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok()?.parse().ok())
-                    .unwrap_or(5);
-                std::thread::sleep(Duration::from_secs(wait));
-                continue;
-            }
-            return resp.error_for_status().with_context(|| url.to_owned());
-        }
-        bail!("{url}: throttled")
+        self.session.send(url, || self.session.client.get(url))
     }
 
-    pub fn list(
+    pub(crate) fn list(
         &self,
         folder: &str,
         delta: Option<String>,
@@ -244,14 +191,6 @@ impl OneDrive {
 }
 
 impl Source for OneDrive {
-    fn resources(&self, asset: &Asset, _local_id: &str) -> Result<Vec<Resource>> {
-        Ok(vec![Resource {
-            index: 0,
-            kind: Kind::Original,
-            filename: asset.filename.clone(),
-        }])
-    }
-
     fn write(&self, local_id: &str, _index: usize, dest: &Path) -> Result<String> {
         let resp = self.get(&format!("{GRAPH}/items/{local_id}/content"))?;
         write_hashed(resp, dest)

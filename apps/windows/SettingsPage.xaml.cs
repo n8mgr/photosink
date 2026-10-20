@@ -19,7 +19,6 @@ public sealed partial class SettingsPage : UserControl
         [TemplateKind.Filename] = Array.Empty<string>(),
     };
     private Core? core;
-    private Options? options;
     private Action saved = () => { };
     private Settings? settings;
     private DispatcherQueueTimer? previewTimer;
@@ -37,42 +36,47 @@ public sealed partial class SettingsPage : UserControl
         ErrorBar.IsOpen = true;
     }
 
-    private void ShowOptions(Options o)
+    private void ShowOptions()
     {
-        DateSourceBox.ItemsSource = o.DateSources.Select(x => x.Label).ToList();
-        DateSourceCard.Description = o.DateSourceHint;
-        ZoneBox.ItemsSource = o.Zones.Select(x => x.Label).ToList();
-        ZoneCard.Description = o.ZoneHint;
-        OffsetBox.PlaceholderText = o.OffsetPlaceholder;
-        MediaBox.ItemsSource = o.Media.Select(x => x.Label).ToList();
-        FavoritesCard.Header = o.FavoritesLabel;
-        AlbumsBox.PlaceholderText = o.ListPlaceholder;
-        KeywordsBox.PlaceholderText = o.ListPlaceholder;
-        EditsBox.ItemsSource = new List<string> { o.EditsOff, o.EditsOn };
-        EditsCard.Description = o.EditsHint;
-        MetadataBox.ItemsSource = o.Metadata.Select(x => x.Label).ToList();
-        MetadataCard.Description = o.MetadataHint;
-        FolderBox.PlaceholderText = o.FolderPlaceholder;
-        FilenameBox.PlaceholderText = o.FilenamePlaceholder;
+        DateSourceBox.ItemsSource = Copy.DateSources.Select(Copy.DateSourceLabel).ToList();
+        DateSourceCard.Description = Copy.DateSourceHint;
+        ZoneBox.ItemsSource = Copy.Zones.Select(Copy.ZoneLabel).ToList();
+        ZoneCard.Description = Copy.ZoneHint;
+        OffsetBox.PlaceholderText = Copy.OffsetPlaceholder;
+        MediaBox.ItemsSource = Copy.MediaChoices.Select(Copy.MediaLabel).ToList();
+        FavoritesCard.Header = Copy.Favorites;
+        AlbumsBox.PlaceholderText = Copy.ListPlaceholder;
+        KeywordsBox.PlaceholderText = Copy.ListPlaceholder;
+        EditsBox.ItemsSource = new List<string> { Copy.EditsOff, Copy.EditsOn };
+        EditsCard.Description = Copy.EditsHint;
+        MetadataBox.ItemsSource = Copy.MetadataChoices.Select(Copy.MetadataLabel).ToList();
+        MetadataCard.Description = Copy.MetadataHint;
+        FolderBox.PlaceholderText = Copy.FolderPlaceholder;
+        FilenameBox.PlaceholderText = Copy.FilenamePlaceholder;
     }
 
-    private void BuildFieldMenu(DropDownButton button, TextBox box, TemplateKind kind, FieldGroup[] fields)
+    private void BuildFieldMenu(DropDownButton button, TextBox box, TemplateKind kind, Field[] fields)
     {
         var flyout = new MenuFlyout();
         flyout.Opening += (_, _) =>
         {
             flyout.Items.Clear();
-            foreach (var group in fields)
+            foreach (var group in Copy.FieldGroups)
             {
-                var sub = new MenuFlyoutSubItem { Text = group.Name };
-                foreach (var f in group.Fields)
+                var members = fields.Where(f => f.Group == group).ToList();
+                if (members.Count == 0)
+                {
+                    continue;
+                }
+                var sub = new MenuFlyoutSubItem { Text = group.ToString() };
+                foreach (var f in members)
                 {
                     var item = new MenuFlyoutItem { Text = f.Name };
                     if (used[kind].Contains(f.Name))
                     {
                         item.Icon = new FontIcon { Glyph = "" };
                     }
-                    ToolTipService.SetToolTip(item, f.Help);
+                    ToolTipService.SetToolTip(item, Copy.FieldHelp(f.Name));
                     var token = f.Token;
                     item.Click += (_, _) => InsertField(box, kind, token);
                     sub.Items.Add(item);
@@ -85,11 +89,16 @@ public sealed partial class SettingsPage : UserControl
 
     private void InsertField(TextBox box, TemplateKind kind, string token)
     {
-        var start = box.SelectionStart;
-        var end = start + box.SelectionLength;
-        var insertion = core!.InsertField(box.Text, (uint)start, (uint)end, token, kind);
-        box.Text = insertion.Text;
-        box.Select((int)insertion.Caret, 0);
+        var text = box.Text;
+        var start = Math.Clamp(box.SelectionStart, 0, text.Length);
+        var end = Math.Clamp(start + box.SelectionLength, start, text.Length);
+        var insert = token;
+        if (start > 0 && "/_-{|.".IndexOf(text[start - 1]) < 0)
+        {
+            insert = (kind == TemplateKind.Folder ? "/" : "_") + token;
+        }
+        box.Text = text[..start] + insert + text[end..];
+        box.Select(start + insert.Length, 0);
         box.Focus(FocusState.Programmatic);
         CommitTemplate(kind);
     }
@@ -107,20 +116,19 @@ public sealed partial class SettingsPage : UserControl
         var c = core;
         try
         {
-            var (folder, file) = await Task.Run(() =>
-                (c.Preview(draft, TemplateKind.Folder), c.Preview(draft, TemplateKind.Filename)));
+            var preview = await Task.Run(() => c.Preview(draft));
             if (generation != previewGeneration)
             {
                 return;
             }
-            FolderPreview.Show(folder, TemplateKind.Folder);
-            FilenamePreview.Show(file, TemplateKind.Filename);
-            used[TemplateKind.Folder] = folder.Used;
-            used[TemplateKind.Filename] = file.Used;
+            FolderPreview.Show(preview, TemplateKind.Folder);
+            FilenamePreview.Show(preview, TemplateKind.Filename);
+            used[TemplateKind.Folder] = preview.Folder.Used;
+            used[TemplateKind.Filename] = preview.Filename.Used;
         }
         catch (Exception e)
         {
-            ShowError(e.Message);
+            ShowError(Copy.ErrorText(e));
         }
     }
 
@@ -133,23 +141,22 @@ public sealed partial class SettingsPage : UserControl
     private void ShowSettings()
     {
         var s = settings!;
-        var o = options!;
         loading = true;
         ExportCard.Description = s.ExportDir;
         FolderBox.Text = s.Path;
         FilenameBox.Text = s.Filename;
-        DateSourceBox.SelectedIndex = Array.FindIndex(o.DateSources, x => x.Value == s.DateSource);
-        ZoneBox.SelectedIndex = Array.FindIndex(o.Zones, x => x.Value == s.Zone);
+        DateSourceBox.SelectedIndex = Array.IndexOf(Copy.DateSources, s.DateSource);
+        ZoneBox.SelectedIndex = Array.IndexOf(Copy.Zones, s.Zone);
         OffsetBox.Text = s.Offset;
         OffsetBox.Visibility = s.Zone == ZoneMode.Fixed ? Visibility.Visible : Visibility.Collapsed;
-        MediaBox.SelectedIndex = Array.FindIndex(o.Media, x => x.Value == s.Media);
+        MediaBox.SelectedIndex = Array.IndexOf(Copy.MediaChoices, s.Media);
         FavoritesSwitch.IsOn = s.Favorites;
         FromPicker.Date = ParseDate(s.From);
         ToPicker.Date = ParseDate(s.To);
         AlbumsBox.Text = s.Albums;
         KeywordsBox.Text = s.Keywords;
         EditsBox.SelectedIndex = s.Edits ? 1 : 0;
-        MetadataBox.SelectedIndex = Array.FindIndex(o.Metadata, x => x.Value == s.Metadata);
+        MetadataBox.SelectedIndex = Array.IndexOf(Copy.MetadataChoices, s.Metadata);
         loading = false;
         ShowSummaries();
         UpdatePreviews();
@@ -157,12 +164,12 @@ public sealed partial class SettingsPage : UserControl
 
     private void ShowSummaries()
     {
-        var m = core!.Summaries(settings!);
-        LayoutExpander.Description = m.Layout;
-        DatesExpander.Description = m.Dates;
-        FilterExpander.Description = m.Filter;
-        FilesExpander.Description = m.Files;
-        FilterHint.Message = m.FilterHint;
+        var s = settings!;
+        LayoutExpander.Description = Copy.LayoutSummary(s);
+        DatesExpander.Description = Copy.ClockSummary(s);
+        FilterExpander.Description = Copy.FilterSummary(s);
+        FilesExpander.Description = Copy.FilesSummary(s);
+        FilterHint.Message = Copy.FilterHint(s);
     }
 
     private void Edit(Func<Settings, Settings> change)
@@ -186,7 +193,7 @@ public sealed partial class SettingsPage : UserControl
         }
         catch (CoreException e)
         {
-            ShowError(e.Message);
+            ShowError(Copy.ErrorText(e));
         }
         SchedulePreviews();
         saved();
@@ -198,9 +205,10 @@ public sealed partial class SettingsPage : UserControl
         {
             return;
         }
-        var preview = core.Preview(Draft(), kind);
+        var preview = core.Preview(Draft());
         (kind == TemplateKind.Folder ? FolderPreview : FilenamePreview).Show(preview, kind);
-        if (preview.Problem is not null)
+        var check = kind == TemplateKind.Folder ? preview.Folder : preview.Filename;
+        if (check.Unknown.Length > 0)
         {
             return;
         }
@@ -238,7 +246,7 @@ public sealed partial class SettingsPage : UserControl
             }
         };
 
-    private void Wire(Options o)
+    private void Wire()
     {
         ExportDirBrowse.Click += async (_, _) =>
         {
@@ -253,15 +261,15 @@ public sealed partial class SettingsPage : UserControl
         OnCommit(FolderBox, () => CommitTemplate(TemplateKind.Folder));
         OnCommit(FilenameBox, () => CommitTemplate(TemplateKind.Filename));
 
-        OnPick(DateSourceBox, i => Edit(s => s with { DateSource = o.DateSources[i].Value }));
+        OnPick(DateSourceBox, i => Edit(s => s with { DateSource = Copy.DateSources[i] }));
         OnPick(ZoneBox, i =>
         {
-            OffsetBox.Visibility = o.Zones[i].Value == ZoneMode.Fixed ? Visibility.Visible : Visibility.Collapsed;
-            Edit(s => s with { Zone = o.Zones[i].Value });
+            OffsetBox.Visibility = Copy.Zones[i] == ZoneMode.Fixed ? Visibility.Visible : Visibility.Collapsed;
+            Edit(s => s with { Zone = Copy.Zones[i] });
         });
         OnCommit(OffsetBox, () => Edit(s => s with { Offset = OffsetBox.Text.Trim() }));
 
-        OnPick(MediaBox, i => Edit(s => s with { Media = o.Media[i].Value }));
+        OnPick(MediaBox, i => Edit(s => s with { Media = Copy.MediaChoices[i] }));
         FavoritesSwitch.Toggled += (_, _) => Edit(s => s with { Favorites = FavoritesSwitch.IsOn });
         FromPicker.DateChanged += (_, _) => Edit(s => s with { From = FormatDate(FromPicker.Date) });
         ToPicker.DateChanged += (_, _) => Edit(s => s with { To = FormatDate(ToPicker.Date) });
@@ -269,7 +277,7 @@ public sealed partial class SettingsPage : UserControl
         OnCommit(KeywordsBox, () => Edit(s => s with { Keywords = KeywordsBox.Text }));
 
         OnPick(EditsBox, i => Edit(s => s with { Edits = i == 1 }));
-        OnPick(MetadataBox, i => Edit(s => s with { Metadata = o.Metadata[i].Value }));
+        OnPick(MetadataBox, i => Edit(s => s with { Metadata = Copy.MetadataChoices[i] }));
     }
 
     /// <summary>Loads settings from <paramref name="core"/>; <paramref name="onSaved"/> runs after each save attempt.</summary>
@@ -277,24 +285,23 @@ public sealed partial class SettingsPage : UserControl
     {
         this.core = core;
         saved = onSaved;
-        options = core.Options();
         previewTimer = DispatcherQueue.CreateTimer();
         previewTimer.Interval = TimeSpan.FromMilliseconds(120);
         previewTimer.IsRepeating = false;
         previewTimer.Tick += (_, _) => UpdatePreviews();
 
-        ShowOptions(options);
+        ShowOptions();
         var fields = core.Fields();
         BuildFieldMenu(FolderInsert, FolderBox, TemplateKind.Folder, fields);
         BuildFieldMenu(FilenameInsert, FilenameBox, TemplateKind.Filename, fields);
-        Wire(options);
+        Wire();
         try
         {
             settings = core.Settings();
         }
         catch (CoreException e)
         {
-            ShowError(e.Message);
+            ShowError(Copy.ErrorText(e));
             Body.Visibility = Visibility.Collapsed;
             return;
         }

@@ -13,21 +13,58 @@ struct Refs: RandomAccessCollection {
     subscript(i: Int) -> Ref { Ref(id: i) }
 }
 
+extension Detail {
+    var text: String {
+        switch self {
+        case let .placed(path), let .metadata(path): path
+        case let .duplicate(existing): existing
+        case let .redated(from, to): "\(from.map(WallClock.text) ?? "none") → \(WallClock.text(to))"
+        case let .error(subject, message): subject.map { "\($0): \(message)" } ?? message
+        case .nothingNew: "nothing new"
+        }
+    }
+}
+
+extension Row {
+    var copyText: String {
+        let parts: [String]
+        switch self {
+        case let .run(title, facts, _):
+            parts = [title?.text ?? ""] + facts.map { [$0.value, $0.label].filter { !$0.isEmpty }.joined(separator: " ") }
+        case let .asset(position, name, _, details, _):
+            parts = [position.map { "\($0.n.formatted())/\($0.total.formatted())" } ?? "", name ?? "…"] + details.map(\.text)
+        case let .clean(path, reason, outcome, _):
+            parts = [reason.label, path, outcome.label]
+        case let .error(subject, message):
+            parts = [subject.map { "\($0): \(message)" } ?? message]
+        case let .signIn(prompt, url):
+            if case let .deviceCode(code) = prompt {
+                parts = [prompt.tag, code, url]
+            } else {
+                parts = [prompt.tag, url]
+            }
+        }
+        return parts.filter { !$0.isEmpty }.joined(separator: "\t")
+    }
+}
+
 struct DetailText: View {
     let detail: Detail
 
     var body: some View {
-        switch detail.kind {
-        case .new:
-            Text("\(Text("→").foregroundStyle(.tertiary)) \(detail.text)")
-        case .duplicate:
-            Text("\(Text("=").foregroundStyle(.tertiary)) \(Text(detail.text).foregroundStyle(.secondary))")
-        case .metadata:
-            Text("\(Text("xmp").font(.caption2).foregroundStyle(.tertiary)) \(Text(detail.text).foregroundStyle(.secondary))")
-        case .note:
-            Text(detail.text).foregroundStyle(.secondary)
+        switch detail {
+        case let .placed(path):
+            Text("\(Text("→").foregroundStyle(.tertiary)) \(path)")
+        case let .duplicate(existing):
+            Text("\(Text("=").foregroundStyle(.tertiary)) \(Text(existing).foregroundStyle(.secondary))")
+        case let .metadata(path):
+            Text("\(Text("xmp").font(.caption2).foregroundStyle(.tertiary)) \(Text(path).foregroundStyle(.secondary))")
+        case let .redated(from, to):
+            Text("\(Text(from.map(WallClock.text) ?? "none").foregroundStyle(.secondary))  \(Text("→").foregroundStyle(.tertiary)) \(WallClock.text(to))")
         case .error:
             Text(detail.text).foregroundStyle(.red)
+        case .nothingNew:
+            Text(detail.text).foregroundStyle(.secondary)
         }
     }
 }
@@ -39,12 +76,6 @@ struct StatusGrid: View {
     private func row(_ i: Int) -> Row? {
         _ = model.tabs[tab]?.version
         return model.row(tab, i)
-    }
-
-    private func copyText(_ r: Row) -> String {
-        ([r.position + r.of, r.tag, r.title] + r.details.map(\.text) + r.facts.map { "\($0.value) \($0.label)" })
-            .filter { !$0.isEmpty }
-            .joined(separator: "\t")
     }
 
     var body: some View {
@@ -73,7 +104,7 @@ struct StatusGrid: View {
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
                 .contextMenu(forSelectionType: Ref.ID.self) { ids in
                     Button("Copy") {
-                        let text = ids.sorted().compactMap { row($0) }.map(copyText).joined(separator: "\n")
+                        let text = ids.sorted().compactMap { row($0) }.map(\.copyText).joined(separator: "\n")
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(text, forType: .string)
                     }
@@ -99,15 +130,17 @@ struct StatusGrid: View {
 
     @ViewBuilder
     private func position(_ r: Row) -> some View {
-        switch r.kind {
-        case .asset:
-            Text("\(r.position)\(Text(r.of).foregroundStyle(.tertiary))")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-        case .clean:
-            Text(r.tag.uppercased())
+        switch r {
+        case let .asset(position, _, _, _, _):
+            if let position {
+                Text("\(position.n.formatted())\(Text("/\(position.total.formatted())").foregroundStyle(.tertiary))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        case let .clean(_, reason, _, failed):
+            Text(reason.label.uppercased())
                 .font(.caption2)
-                .foregroundStyle(r.failed ? .red : .secondary)
+                .foregroundStyle(failed ? .red : .secondary)
         case .run:
             Image(systemName: "play.fill").foregroundStyle(.tertiary).font(.caption2)
         case .error:
@@ -119,49 +152,64 @@ struct StatusGrid: View {
 
     @ViewBuilder
     private func item(_ r: Row) -> some View {
-        switch r.kind {
-        case .run:
-            Text(r.title).fontWeight(.semibold).lineLimit(1)
-        case .signIn:
+        switch r {
+        case let .run(title, _, _):
+            Text(title?.text ?? "").fontWeight(.semibold).lineLimit(1)
+        case let .signIn(prompt, _):
             HStack {
-                Text(r.tag).foregroundStyle(.secondary)
-                if !r.title.isEmpty {
-                    Text(r.title).font(.title3.monospaced().weight(.semibold)).textSelection(.enabled)
+                Text(prompt.tag).foregroundStyle(.secondary)
+                if case let .deviceCode(code) = prompt {
+                    Text(code).font(.title3.monospaced().weight(.semibold)).textSelection(.enabled)
                 }
             }
-        case .error:
-            Text(r.title).foregroundStyle(.red).textSelection(.enabled)
-        case .clean:
-            Text(r.title).font(.callout.monospaced()).lineLimit(1).truncationMode(.middle).help(r.title)
-        case .asset:
-            Text(r.title).foregroundStyle(r.failed ? .red : .primary).lineLimit(1).truncationMode(.middle)
+        case let .error(subject, message):
+            Text(subject.map { "\($0): \(message)" } ?? message).foregroundStyle(.red).textSelection(.enabled)
+        case let .clean(path, _, _, _):
+            Text(path).font(.callout.monospaced()).lineLimit(1).truncationMode(.middle).help(path)
+        case let .asset(_, name, _, _, failed):
+            Text(name ?? "…").foregroundStyle(failed ? .red : .primary).lineLimit(1).truncationMode(.middle)
         }
     }
 
     @ViewBuilder
     private func result(_ r: Row) -> some View {
-        switch r.kind {
-        case .run:
+        switch r {
+        case let .run(_, facts, logPath):
             HStack(spacing: 14) {
-                ForEach(Array(r.facts.enumerated()), id: \.offset) { _, f in
+                ForEach(Array(facts.enumerated()), id: \.offset) { _, f in
                     Text("\(Text(f.value).monospacedDigit())\(Text(f.value.isEmpty ? f.label : " \(f.label)").foregroundStyle(.secondary))")
                         .lineLimit(1)
                         .help(f.tooltip)
                 }
                 Spacer(minLength: 0)
-                if !r.logPath.isEmpty {
-                    Button("Log File") { model.open(r.logPath) }
+                if !logPath.isEmpty {
+                    Button("Log File") { model.open(logPath) }
                         .buttonStyle(.link)
-                        .help(r.logPath)
+                        .help(logPath)
                 }
             }
-        case .signIn:
-            Link(r.url, destination: URL(string: r.url) ?? URL(string: "https://microsoft.com/devicelogin")!)
+        case let .signIn(_, url):
+            if let link = URL(string: url) {
+                Link(url, destination: link)
+            } else {
+                Text(url).textSelection(.enabled)
+            }
         case .error:
             EmptyView()
-        case .asset, .clean:
+        case let .clean(_, _, outcome, _):
+            SwiftUI.Group {
+                switch outcome {
+                case .removed:
+                    Text("\(Text("→").foregroundStyle(.tertiary)) \(outcome.label)")
+                case .kept, .wouldRemove:
+                    Text(outcome.label).foregroundStyle(.secondary)
+                }
+            }
+            .font(.callout.monospaced())
+            .lineLimit(1)
+        case let .asset(_, _, _, details, _):
             HStack(spacing: 12) {
-                ForEach(Array(r.details.enumerated()), id: \.offset) { _, d in
+                ForEach(Array(details.enumerated()), id: \.offset) { _, d in
                     DetailText(detail: d)
                         .font(.callout.monospaced())
                         .lineLimit(1)

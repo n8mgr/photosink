@@ -24,7 +24,7 @@ fn kind(t: PHAssetResourceType) -> Option<Kind> {
     })
 }
 
-pub fn authorize() -> Result<()> {
+pub(crate) fn authorize() -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let handler = RcBlock::new(move |status: PHAuthorizationStatus| {
         let _ = tx.send(status);
@@ -41,7 +41,7 @@ pub fn authorize() -> Result<()> {
     }
 }
 
-pub fn list_assets() -> Vec<(String, String)> {
+pub(crate) fn list_assets() -> Vec<(String, String)> {
     let result = unsafe { PHAsset::fetchAssetsWithOptions(None) };
     (0..unsafe { result.count() })
         .map(|i| {
@@ -60,7 +60,7 @@ fn fetch(local_id: &str) -> Result<Retained<NSArray<PHAssetResource>>> {
     Ok(unsafe { PHAssetResource::assetResourcesForAsset(&asset) })
 }
 
-pub fn resources(local_id: &str) -> Result<Vec<Resource>> {
+pub(crate) fn resources(local_id: &str) -> Result<Vec<Resource>> {
     Ok(fetch(local_id)?
         .iter()
         .enumerate()
@@ -75,7 +75,7 @@ pub fn resources(local_id: &str) -> Result<Vec<Resource>> {
         .collect())
 }
 
-pub fn write_resource(local_id: &str, index: usize, dest: &Path) -> Result<()> {
+pub(crate) fn write_resource(local_id: &str, index: usize, dest: &Path) -> Result<()> {
     let resources = fetch(local_id)?;
     if index >= resources.len() {
         bail!("resource {index} of {local_id} missing");
@@ -117,25 +117,5 @@ mod tests {
         );
         assert_eq!(kind(PHAssetResourceType::AdjustmentBasePhoto), None);
         assert_eq!(kind(PHAssetResourceType::PhotoProxy), None);
-    }
-
-    #[test]
-    #[ignore]
-    fn downloads_first_original() {
-        authorize().unwrap();
-        let assets = list_assets();
-        let (uuid, id) = assets.first().expect("library is empty");
-        let rs = resources(id).unwrap();
-        let original = rs.iter().find(|r| r.kind == Kind::Original).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join(&original.filename);
-        write_resource(id, original.index, &dest).unwrap();
-        let len = std::fs::metadata(&dest).unwrap().len();
-        println!(
-            "{uuid} {} {len} bytes, {} resources",
-            original.filename,
-            rs.len()
-        );
-        assert!(len > 0);
     }
 }

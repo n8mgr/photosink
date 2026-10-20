@@ -5,11 +5,11 @@
 //! after the last box, which moves nothing; CR3 additionally records the box in
 //! Canon's `CTBO` offset table.
 
-use super::{pad, padded, read_at, same, tmp_path, write_at};
+use super::{pad, padded, read_at, replace_with, same, write_at};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, TimeZone, Utc};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 const XMP_UUID: [u8; 16] = [
@@ -35,6 +35,12 @@ impl Atom {
 
     fn end(&self) -> u64 {
         self.pos + self.size
+    }
+
+    /// File position and length of a `uuid` box's data after its 16-byte id.
+    fn uuid_data(&self) -> (u64, usize) {
+        let at = self.pos + self.header + 16;
+        (at, (self.end() - at) as usize)
     }
 }
 
@@ -171,16 +177,6 @@ fn copy_range(f: &mut File, out: &mut File, pos: u64, len: u64) -> Result<()> {
     Ok(())
 }
 
-trait Take {
-    fn take(&mut self, n: u64) -> std::io::Take<&mut File>;
-}
-
-impl Take for File {
-    fn take(&mut self, n: u64) -> std::io::Take<&mut File> {
-        std::io::Read::take(self, n)
-    }
-}
-
 /// The `mvhd` creation time of a MOV/MP4, if set.
 pub fn creation_time(path: &Path) -> Option<DateTime<Utc>> {
     let mut f = File::open(path).ok()?;
@@ -207,8 +203,8 @@ pub fn creation_time(path: &Path) -> Option<DateTime<Utc>> {
     epoch.checked_add_signed(chrono::Duration::seconds(i64::try_from(secs).ok()?))
 }
 
-/// The top-level `meta` box and its bytes, when the file is item-based (HEIF).
-fn item_meta(f: &mut File, top: &[Atom]) -> Result<Option<(Atom, Vec<u8>)>> {
+/// The top-level `meta` box, parsed, when the file is item-based (HEIF).
+fn item_meta(f: &mut File, top: &[Atom]) -> Result<Option<Items>> {
     let Some(meta) = top.iter().find(|b| &b.kind == b"meta") else {
         return Ok(None);
     };
@@ -217,7 +213,10 @@ fn item_meta(f: &mut File, top: &[Atom]) -> Result<Option<(Atom, Vec<u8>)>> {
     let item_based = boxes_in(&buf, body.start, body.end)?
         .iter()
         .any(|b| &b.kind == b"iinf");
-    Ok(item_based.then(|| (meta.clone(), buf)))
+    if !item_based {
+        return Ok(None);
+    }
+    Items::parse(meta.clone(), buf).map(Some)
 }
 
 fn xmp_uuid(f: &mut File, top: &[Atom]) -> Result<Option<Atom>> {
@@ -236,18 +235,12 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let top = top_boxes(&mut f, len)?;
-    if let Some((meta, buf)) = item_meta(&mut f, &top)? {
-        let items = Items::parse(&meta, &buf)?;
-        return match items.xmp_data() {
-            Some((at, n)) => Ok(Some(read_at(&mut f, at, n)?)),
-            None => Ok(None),
-        };
-    }
-    match xmp_uuid(&mut f, &top)? {
-        Some(b) => {
-            let at = b.pos + b.header + 16;
-            Ok(Some(read_at(&mut f, at, (b.end() - at) as usize)?))
-        }
+    let data = match item_meta(&mut f, &top)? {
+        Some(items) => items.xmp_data(),
+        None => xmp_uuid(&mut f, &top)?.map(|b| b.uuid_data()),
+    };
+    match data {
+        Some((at, n)) => Ok(Some(read_at(&mut f, at, n)?)),
         None => Ok(None),
     }
 }
@@ -256,13 +249,13 @@ pub fn embed(path: &Path, xmp: &str) -> Result<bool> {
     let mut f = OpenOptions::new().read(true).write(true).open(path)?;
     let len = f.metadata()?.len();
     let top = top_boxes(&mut f, len)?;
+    if let Some(items) = item_meta(&mut f, &top)? {
+        return embed_item(path, &mut f, len, &top, items, xmp);
+    }
     let brand = match top.iter().find(|b| &b.kind == b"ftyp") {
         Some(b) if b.size >= b.header + 4 => read_at(&mut f, b.pos + b.header, 4)?,
         _ => b"qt  ".to_vec(),
     };
-    if let Some((meta, buf)) = item_meta(&mut f, &top)? {
-        return embed_item(path, &mut f, len, &top, &meta, buf, xmp);
-    }
     embed_uuid(&mut f, len, &top, brand == b"crx ", xmp)
 }
 
@@ -304,8 +297,8 @@ fn embed_uuid(f: &mut File, mut len: u64, top: &[Atom], cr3: bool, xmp: &str) ->
         None
     };
     if let Some(b) = xmp_uuid(f, top)? {
-        let data_at = b.pos + b.header + 16;
-        let data = read_at(f, data_at, (b.end() - data_at) as usize)?;
+        let (data_at, n) = b.uuid_data();
+        let data = read_at(f, data_at, n)?;
         if same(&data, xmp) {
             return Ok(false);
         }
@@ -537,6 +530,8 @@ fn shift_chunk_offsets(
 
 /// The parts of a `meta` box that item insertion touches.
 struct Items {
+    meta: Atom,
+    buf: Vec<u8>,
     children: Vec<Atom>,
     primary: u32,
     count_len: usize,
@@ -547,9 +542,9 @@ struct Items {
 }
 
 impl Items {
-    fn parse(meta: &Atom, buf: &[u8]) -> Result<Items> {
+    fn parse(meta: Atom, buf: Vec<u8>) -> Result<Items> {
         let body_start = (meta.header + 4) as usize;
-        let children = boxes_in(buf, body_start, buf.len())?;
+        let children = boxes_in(&buf, body_start, buf.len())?;
         let child = |k: &[u8; 4]| children.iter().find(|b| &b.kind == k);
         let pitm = child(b"pitm").context("no pitm")?.body();
         let primary = if buf[pitm.start] == 0 {
@@ -561,7 +556,7 @@ impl Items {
         let count_len = if buf[iinf.start] == 0 { 2 } else { 4 };
         let mut max_id = 0;
         let mut xmp_id = None;
-        for inf in boxes_in(buf, iinf.start + 4 + count_len, iinf.end)? {
+        for inf in boxes_in(&buf, iinf.start + 4 + count_len, iinf.end)? {
             if let Some(i) = parse_infe(&buf[inf.body()]) {
                 max_id = max_id.max(i.id);
                 if i.xmp && xmp_id.is_none() {
@@ -573,6 +568,8 @@ impl Items {
         max_id = iloc.items.iter().fold(max_id, |m, it| m.max(it.id));
         let idat = child(b"idat").map(|b| meta.pos + b.body().start as u64);
         Ok(Items {
+            meta,
+            buf,
             children,
             primary,
             count_len,
@@ -607,11 +604,9 @@ fn embed_item(
     f: &mut File,
     len: u64,
     top: &[Atom],
-    meta: &Atom,
-    buf: Vec<u8>,
+    items: Items,
     xmp: &str,
 ) -> Result<bool> {
-    let items = Items::parse(meta, &buf)?;
     if let Some((at, n)) = items.xmp_data() {
         let existing = read_at(f, at, n)?;
         if same(&existing, xmp) {
@@ -623,6 +618,8 @@ fn embed_item(
         }
     }
     let Items {
+        meta,
+        buf,
         children,
         primary,
         count_len,
@@ -668,7 +665,7 @@ fn embed_item(
         .as_ref()
         .map(|_| make_cdsc(iref_version, id, primary));
 
-    let mut iloc_len = write_iloc(&iloc)?.len() as u64;
+    let iloc_len = write_iloc(&iloc)?.len() as u64;
     let mut new_meta_len = meta.header + 4;
     for c in &children {
         new_meta_len += match &c.kind {
@@ -708,8 +705,6 @@ fn embed_item(
         .extents[0]
         .offset = new_len + 8;
     let iloc_bytes = write_iloc(&iloc)?;
-    iloc_len = iloc_bytes.len() as u64;
-    debug_assert_eq!(iloc_len, write_iloc(&iloc)?.len() as u64);
 
     let mut out = Vec::with_capacity(new_meta_len as usize);
     if meta.header == 16 {
@@ -762,24 +757,22 @@ fn embed_item(
         bail!("meta size mismatch: {} vs {new_meta_len}", out.len());
     }
 
-    let tmp = tmp_path(path);
-    let mut w = File::create(&tmp)?;
-    copy_range(f, &mut w, 0, meta.pos)?;
-    w.write_all(&out)?;
-    for b in top.iter().filter(|b| b.pos >= meta.end()) {
-        if &b.kind == b"moov" && delta != 0 {
-            let mut moov = read_at(f, b.pos, b.size as usize)?;
-            let n = moov.len();
-            shift_chunk_offsets(&mut moov, 0, n, threshold, delta)?;
-            w.write_all(&moov)?;
-        } else {
-            copy_range(f, &mut w, b.pos, b.size)?;
+    replace_with(path, |w| {
+        copy_range(f, w, 0, meta.pos)?;
+        w.write_all(&out)?;
+        for b in top.iter().filter(|b| b.pos >= meta.end()) {
+            if &b.kind == b"moov" && delta != 0 {
+                let mut moov = read_at(f, b.pos, b.size as usize)?;
+                let n = moov.len();
+                shift_chunk_offsets(&mut moov, 0, n, threshold, delta)?;
+                w.write_all(&moov)?;
+            } else {
+                copy_range(f, w, b.pos, b.size)?;
+            }
         }
-    }
-    w.write_all(&with_header(b"mdat", &payload))?;
-    w.flush()?;
-    drop(w);
-    std::fs::rename(&tmp, path)?;
+        w.write_all(&with_header(b"mdat", &payload))?;
+        Ok(())
+    })?;
     Ok(true)
 }
 

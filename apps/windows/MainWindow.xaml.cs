@@ -31,20 +31,26 @@ public sealed partial class MainWindow : Window
         };
 
         SettingsView.Init(core, RefreshTasks);
-        foreach (var group in core.Groups())
+        var available = core.Tabs();
+        foreach (var (name, tabs) in Copy.Groups)
         {
-            Nav.MenuItems.Add(new NavigationViewItemHeader { Content = group.Name });
-            foreach (var info in group.Tabs)
+            var present = tabs.Where(t => Array.IndexOf(available, t) >= 0).ToList();
+            if (present.Count == 0)
+            {
+                continue;
+            }
+            Nav.MenuItems.Add(new NavigationViewItemHeader { Content = name });
+            foreach (var tab in present)
             {
                 var item = new NavigationViewItem
                 {
-                    Content = info.Name,
-                    Icon = new FontIcon { Glyph = Glyph(info.Tab) },
-                    Tag = (int)info.Tab,
+                    Content = Copy.TabName(tab),
+                    Icon = new FontIcon { Glyph = Glyph(tab) },
+                    Tag = (int)tab,
                 };
-                var page = new TabPage(core, info) { Visibility = Visibility.Collapsed };
-                items[info.Tab] = item;
-                pages[info.Tab] = page;
+                var page = new TabPage(core, tab) { Visibility = Visibility.Collapsed };
+                items[tab] = item;
+                pages[tab] = page;
                 Nav.MenuItems.Add(item);
                 Pages.Children.Add(page);
             }
@@ -107,14 +113,15 @@ public sealed partial class MainWindow : Window
     private void RefreshStatus()
     {
         var status = core.Status();
-        lastRun = status.Running ?? lastRun;
+        var running = core.Running();
+        lastRun = running ?? lastRun;
         foreach (var (tab, item) in items)
         {
-            item.IsEnabled = status.Running is null || status.Running == tab;
+            item.IsEnabled = running is null || running == tab;
         }
         foreach (var (tab, page) in pages)
         {
-            page.RefreshStatus(status, lastRun is null || lastRun == tab);
+            page.RefreshStatus(status, running, lastRun is null || lastRun == tab);
         }
     }
 
