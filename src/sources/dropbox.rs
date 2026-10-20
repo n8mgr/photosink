@@ -1,6 +1,5 @@
 use super::oauth::{Provider, Session, Token, now};
 use super::{Source, is_media, is_video};
-use crate::export::write_hashed;
 use crate::photo::Asset;
 use crate::{Event, Progress};
 use anyhow::{Context, Result, bail};
@@ -263,13 +262,12 @@ impl Source for Dropbox {
     fn write(&self, local_id: &str, _index: usize, dest: &Path) -> Result<String> {
         let url = format!("{CONTENT}/files/download");
         let arg = json!({ "path": local_id }).to_string();
-        let resp = self.session.send("files/download", || {
+        self.session.download(dest, || {
             self.session
                 .client
                 .post(&url)
                 .header("Dropbox-API-Arg", &arg)
-        })?;
-        write_hashed(resp, dest)
+        })
     }
 }
 

@@ -1,7 +1,6 @@
 use super::Source;
 use super::oauth::{Provider, Session, Token, now};
 use crate::Progress;
-use crate::export::write_hashed;
 use crate::photo::{Asset, Camera};
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
@@ -192,8 +191,9 @@ impl OneDrive {
 
 impl Source for OneDrive {
     fn write(&self, local_id: &str, _index: usize, dest: &Path) -> Result<String> {
-        let resp = self.get(&format!("{GRAPH}/items/{local_id}/content"))?;
-        write_hashed(resp, dest)
+        let url = format!("{GRAPH}/items/{local_id}/content");
+        self.session
+            .download(dest, || self.session.client.get(&url))
     }
 }
 

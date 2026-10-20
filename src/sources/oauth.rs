@@ -74,6 +74,33 @@ impl<P: Provider> Session<P> {
         Ok(session)
     }
 
+    pub(super) fn download(
+        &self,
+        dest: &Path,
+        request: impl Fn() -> RequestBuilder,
+    ) -> Result<String> {
+        super::retry::download(dest, || {
+            let response = request().bearer_auth(self.access_token()?).send()?;
+            let wait = matches!(response.status().as_u16(), 429 | 503).then(|| {
+                Duration::from_secs(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()?.parse().ok())
+                        .unwrap_or(5),
+                )
+            });
+            let response = response.error_for_status().map_err(|error| {
+                let error = anyhow::Error::new(error);
+                match wait {
+                    Some(wait) => error.context(super::retry::RetryDelay(wait)),
+                    None => error,
+                }
+            })?;
+            crate::export::write_hashed(response, dest)
+        })
+    }
+
     /// Sends the request with the access token, waiting out 429 and 503
     /// responses up to five times.
     pub(super) fn send(

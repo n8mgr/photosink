@@ -15,7 +15,9 @@ impl Source for PhotoKit {
         photokit::resources(local_id)
     }
     fn write(&self, local_id: &str, index: usize, dest: &Path) -> Result<String> {
-        photokit::write_resource(local_id, index, dest)?;
-        hash_file(dest)
+        super::retry::download(dest, || {
+            photokit::write_resource(local_id, index, dest)?;
+            hash_file(dest)
+        })
     }
 }

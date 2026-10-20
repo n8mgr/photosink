@@ -3,6 +3,7 @@ pub mod apple_photos;
 pub mod dropbox;
 mod oauth;
 pub mod onedrive;
+mod retry;
 pub mod takeout;
 
 use crate::photo::Asset;
