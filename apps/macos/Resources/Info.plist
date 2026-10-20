@@ -26,5 +26,7 @@
 	<string>NSApplication</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Photosink reads your Photos library to export originals and metadata.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Photosink reveals the selected photo or video in Photos.</string>
 </dict>
 </plist>

@@ -592,6 +592,13 @@ impl Core {
         self.with_grid(tab, |g| g.rows(start as usize, count as usize))
     }
 
+    pub fn photos_id(&self, tab: Tab, index: u32) -> Option<String> {
+        if tab != Tab::ApplePhotos {
+            return None;
+        }
+        self.with_grid(tab, |g| g.source_id(index as usize))
+    }
+
     pub fn chips(&self, tab: Tab) -> Vec<Chip> {
         self.with_grid(tab, |g| g.chips())
     }
@@ -680,6 +687,7 @@ mod tests {
                     n,
                     total: 50,
                     name: format!("a{n}"),
+                    source_id: None,
                 },
             );
         }

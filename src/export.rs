@@ -386,6 +386,7 @@ impl<'a> Exporter<'a> {
             n,
             total,
             name: asset.filename.clone(),
+            source_id: Some(local_id.to_owned()),
         });
         if let Err(e) = self.asset(src, asset, local_id) {
             self.fail(&asset.filename, format!("{e:#}"));

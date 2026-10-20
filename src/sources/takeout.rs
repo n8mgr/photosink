@@ -66,6 +66,7 @@ impl Import<'_> {
                     n,
                     total,
                     name: asset.filename.clone(),
+                    source_id: None,
                 });
                 ex.sidecar(asset)?;
             }

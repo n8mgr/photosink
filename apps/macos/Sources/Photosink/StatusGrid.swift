@@ -103,6 +103,10 @@ struct StatusGrid: View {
                 }
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
                 .contextMenu(forSelectionType: Ref.ID.self) { ids in
+                    if ids.count == 1, let index = ids.first,
+                       let id = model.core.photosId(tab: tab, index: UInt32(index)) {
+                        Button("Open in Photos") { model.openInPhotos(id) }
+                    }
                     Button("Copy") {
                         let text = ids.sorted().compactMap { row($0) }.map(\.copyText).joined(separator: "\n")
                         NSPasteboard.general.clearContents()

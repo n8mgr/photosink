@@ -177,6 +177,7 @@ enum Item {
     Asset {
         position: Option<(usize, usize)>,
         name: String,
+        source_id: Option<String>,
         details: Vec<Detail>,
         moved: bool,
         redated: bool,
@@ -352,6 +353,7 @@ impl Grid {
                 self.items.push(Item::Asset {
                     position: Some((n, total)),
                     name: String::new(),
+                    source_id: None,
                     details: Vec::new(),
                     moved: false,
                     redated: false,
@@ -480,9 +482,14 @@ impl Grid {
                 n,
                 total,
                 name: new,
+                source_id: id,
             } => {
-                if let Item::Asset { name, .. } = self.asset(*n, *total) {
+                if let Item::Asset {
+                    name, source_id, ..
+                } = self.asset(*n, *total)
+                {
                     *name = new.clone();
+                    *source_id = id.clone();
                 }
             }
             Event::Placed { n, total, dest, .. } => {
@@ -521,6 +528,7 @@ impl Grid {
             Event::Redated { stem, from, to } => self.items.push(Item::Asset {
                 position: None,
                 name: stem.clone(),
+                source_id: None,
                 details: vec![Detail::Redated {
                     from: from.map(stamp),
                     to: stamp(*to),
@@ -574,6 +582,14 @@ impl Grid {
             .copied()
             .collect();
         idx.into_iter().map(|i| self.items[i].row()).collect()
+    }
+
+    pub fn source_id(&mut self, index: usize) -> Option<String> {
+        let i = *self.visible().get(index)?;
+        match &self.items[i] {
+            Item::Asset { source_id, .. } => source_id.clone(),
+            _ => None,
+        }
     }
 
     /// One chip per possible state.
@@ -676,6 +692,7 @@ mod tests {
                 n,
                 total: 3,
                 name: format!("IMG_{n}"),
+                source_id: None,
             });
         }
         g.apply(&placed(2));
@@ -742,6 +759,7 @@ mod tests {
             n: 2,
             total: 3,
             name: "IMG_2".into(),
+            source_id: None,
         });
         g.apply(&Event::error("disk", "full"));
         let rows = g.rows(1, 3);
@@ -782,6 +800,29 @@ mod tests {
     }
 
     #[test]
+    fn source_ids_follow_visible_rows_and_runs() {
+        let mut g = Grid::default();
+        for id in ["first/L0/001", "second/L0/001"] {
+            g.start_run(title());
+            g.apply(&Event::Asset {
+                n: 1,
+                total: 1,
+                name: "IMG_2702.MOV".into(),
+                source_id: Some(id.into()),
+            });
+        }
+        g.apply(&placed(1));
+        assert_eq!(g.source_id(0), None);
+        assert_eq!(g.source_id(1).as_deref(), Some("first/L0/001"));
+        assert_eq!(g.source_id(3).as_deref(), Some("second/L0/001"));
+        g.toggle(RowState::Unchanged, false);
+        assert_eq!(g.source_id(2).as_deref(), Some("second/L0/001"));
+        assert_eq!(g.source_id(3), None);
+        g.clear();
+        assert_eq!(g.source_id(0), None);
+    }
+
+    #[test]
     fn filters_by_state() {
         let mut g = Grid::default();
         g.start_run(title());
@@ -790,6 +831,7 @@ mod tests {
                 n,
                 total: 3,
                 name: format!("IMG_{n}"),
+                source_id: None,
             });
         }
         assert_eq!(g.chips().len(), STATES.len());

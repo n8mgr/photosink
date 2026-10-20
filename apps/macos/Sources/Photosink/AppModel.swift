@@ -44,6 +44,7 @@ struct TabState: Equatable {
 
 @MainActor @Observable
 final class AppModel {
+    @ObservationIgnored private var openingPhotos = false
     @ObservationIgnored let core: Core
     @ObservationIgnored private let relay: Relay
     @ObservationIgnored private var rows: [Tab: Pages<Row>] = [:]
@@ -194,6 +195,31 @@ final class AppModel {
             try core.applyDates()
         } catch {
             notice = message(error, tab: .dates)
+        }
+    }
+
+    func openInPhotos(_ id: String) {
+        guard !openingPhotos else { return }
+        openingPhotos = true
+        Task {
+            defer { openingPhotos = false }
+            let error = await Task.detached { () -> String? in
+                let escaped = id.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                let source = """
+                    tell application id "com.apple.Photos"
+                        activate
+                        spotlight media item id "\(escaped)"
+                    end tell
+                    """
+                guard let script = NSAppleScript(source: source) else {
+                    return "Could not create the Open in Photos script."
+                }
+                var error: NSDictionary?
+                script.executeAndReturnError(&error)
+                return error.map { $0[NSAppleScript.errorMessage] as? String ?? $0.description }
+            }.value
+            if let error { notice = "Could not open in Photos: \(error)" }
         }
     }
 

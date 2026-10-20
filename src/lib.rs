@@ -72,6 +72,7 @@ pub enum Event {
         n: usize,
         total: usize,
         name: String,
+        source_id: Option<String>,
     },
     Placed {
         n: usize,
@@ -187,7 +188,7 @@ impl std::fmt::Display for Event {
                     at(c.modify, "-"),
                 )
             }
-            Event::Asset { n, total, name } => write!(f, "[{n}/{total}] {name}"),
+            Event::Asset { n, total, name, .. } => write!(f, "[{n}/{total}] {name}"),
             Event::Placed {
                 n,
                 total,
