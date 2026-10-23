@@ -4,11 +4,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const HELP: &str = "Usage: cargo xtask build [OPTIONS]
+const HELP: &str = "Usage: cargo build-app [OPTIONS]
+       cargo xtask build [OPTIONS]
 
 Build the native app for the current platform in Release mode.
 
 Options:
+  --open                         Launch the app after a successful build
   --universal                    macOS: build for arm64 and x86_64
   --target <TRIPLE>               Windows or Linux: Rust target triple
   --configuration <Debug|Release> Windows: .NET configuration (default: Release)
@@ -23,6 +25,7 @@ struct BuildOptions {
     target: Option<String>,
     configuration: Option<String>,
     publish: bool,
+    open: bool,
 }
 
 impl BuildOptions {
@@ -32,6 +35,7 @@ impl BuildOptions {
             match arg.as_str() {
                 "--universal" => options.universal = true,
                 "--publish" => options.publish = true,
+                "--open" => options.open = true,
                 "--target" | "--configuration" => {
                     let value = args
                         .next()
@@ -134,6 +138,23 @@ fn output(command: &mut Command) -> Result<String> {
         output.status
     );
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn open_app(path: &Path) -> Result<()> {
+    ensure!(path.exists(), "app not found: {}", path.display());
+    if cfg!(target_os = "macos") {
+        run(Command::new("open").arg(path))
+    } else {
+        eprintln!("Opening {}", path.display());
+        Command::new(path)
+            .current_dir(path.parent().context("missing app directory")?)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("could not open {}", path.display()))?;
+        Ok(())
+    }
 }
 
 fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()> {
@@ -260,6 +281,9 @@ fn build_macos(root: &Path, options: &BuildOptions) -> Result<()> {
     }
     run(codesign.arg("--sign").arg(identity).arg(&app))?;
     println!("{}", app.display());
+    if options.open {
+        open_app(&app)?;
+    }
     Ok(())
 }
 
@@ -292,25 +316,42 @@ fn build_windows(root: &Path, options: &BuildOptions) -> Result<()> {
         .arg("--out-dir")
         .arg(generated))?;
 
+    let configuration = options.configuration.as_deref().unwrap_or("Release");
     let mut dotnet = Command::new("dotnet");
     dotnet
         .current_dir(root)
         .arg(if options.publish { "publish" } else { "build" })
         .arg(here.join("Photosink.csproj"))
-        .args([
-            "-c",
-            options.configuration.as_deref().unwrap_or("Release"),
-            "-r",
-            rid,
-        ])
+        .args(["-c", configuration, "-r", rid])
         .arg(format!("-p:Platform={platform}"))
         .arg(format!("-p:BridgeTriple={target}"));
     if options.publish {
         let out = here.join("bin/publish").join(rid);
         run(dotnet.args(["--self-contained", "-o"]).arg(&out))?;
         println!("Published to {}", out.display());
+        if options.open {
+            open_app(&out.join("Photosink.exe"))?;
+        }
     } else {
         run(&mut dotnet)?;
+        if options.open {
+            let target_path = output(
+                Command::new("dotnet")
+                    .current_dir(root)
+                    .arg("msbuild")
+                    .arg(here.join("Photosink.csproj"))
+                    .arg(format!("-p:Configuration={configuration}"))
+                    .arg(format!("-p:RuntimeIdentifier={rid}"))
+                    .arg(format!("-p:Platform={platform}"))
+                    .arg(format!("-p:BridgeTriple={target}"))
+                    .arg("-getProperty:TargetPath"),
+            )?;
+            ensure!(
+                !target_path.is_empty(),
+                "MSBuild returned an empty TargetPath"
+            );
+            open_app(&here.join(target_path).with_extension("exe"))?;
+        }
     }
     Ok(())
 }
@@ -326,5 +367,13 @@ fn build_linux(root: &Path, options: &BuildOptions) -> Result<()> {
     if let Some(target) = &options.target {
         command.args(["--target", target]);
     }
-    run(&mut command)
+    run(&mut command)?;
+    if options.open {
+        let mut app = here.join("target");
+        if let Some(target) = &options.target {
+            app.push(target);
+        }
+        open_app(&app.join("release/photosink"))?;
+    }
+    Ok(())
 }

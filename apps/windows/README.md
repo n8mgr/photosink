@@ -26,6 +26,7 @@ cargo xtask build                                      # host architecture, Rele
 cargo xtask build --target aarch64-pc-windows-msvc      # ARM64
 cargo xtask build --publish                             # self-contained app in apps\windows\bin\publish\<rid>
 cargo xtask build --configuration Debug                 # Debug .NET build
+cargo build-app --open                                  # build and launch the app
 ```
 
 `cargo xtask build` builds the bridge DLL, regenerates `Generated\photosink_bridge.cs`

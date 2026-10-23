@@ -14,6 +14,13 @@ root, build the app for your platform with:
 cargo xtask build
 ```
 
+`cargo build-app` is a shorter alias for the same build. Add `--open` to launch
+the app after the build succeeds:
+
+```sh
+cargo build-app --open
+```
+
 - **macOS** (SwiftUI, Xcode 26+): builds the bridge, generates the Swift bindings,
   and assembles `apps/macos/build/Photosink.app`. Use `--universal` for arm64 and
   x86_64 (install both Rust targets first). Signing is ad-hoc by default; set

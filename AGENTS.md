@@ -13,7 +13,7 @@ native app per platform over one Rust core.
 | `apps/macos/` | SwiftUI app (SwiftPM, macOS 26). `cargo xtask build` builds the bridge, generates Swift bindings and assembles `build/Photosink.app`. |
 | `apps/linux/` | GTK 4 + libadwaita app; its own Cargo workspace using `bridge` as a crate. |
 | `apps/windows/` | WinUI 3 app (C#, .NET 10). `cargo xtask build` builds the bridge, runs `uniffi-bindgen-cs` and the .NET build. |
-| `xtask/` | Rust build automation for each platform, invoked through the `cargo xtask` alias. |
+| `xtask/` | Rust build automation for each platform, invoked through the `cargo xtask` and `cargo build-app` aliases. |
 | `.changeset/` | Pending changelog entries for knope. |
 
 ## Rules
@@ -51,6 +51,7 @@ cargo clippy --manifest-path apps/linux/Cargo.toml --all-targets -- -D warnings
 
 # Native app for the current platform (Release)
 cargo xtask build
+cargo build-app --open             # build and launch
 
 # macOS app (Xcode 26+)
 cargo xtask build                  # this Mac's arch, ad-hoc signed
