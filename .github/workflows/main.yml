@@ -83,7 +83,7 @@ jobs:
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build
-        run: UNIVERSAL=1 apps/macos/build.sh
+        run: cargo xtask build --universal
 
   linux:
     name: Build Linux
@@ -99,7 +99,7 @@ jobs:
         with:
           workspaces: apps/linux
       - name: Build
-        run: cargo build --release --manifest-path apps/linux/Cargo.toml
+        run: cargo xtask build
 
   windows:
     name: Build Windows
@@ -122,7 +122,7 @@ jobs:
           }
       - name: Build
         shell: pwsh
-        run: apps/windows/build.ps1 -Configuration Release
+        run: cargo xtask build
 
   # Single required check for branch protection.
   success:

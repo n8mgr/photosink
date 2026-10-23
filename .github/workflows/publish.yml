@@ -85,7 +85,7 @@ jobs:
       - name: Build
         run: |
           if [ -n "$APPLE_CERT_B64" ]; then export SIGN_IDENTITY="$APPLE_CERT_ID"; else echo "::warning::No Apple signing secrets; building ad-hoc signed"; fi
-          UNIVERSAL=1 apps/macos/build.sh
+          cargo xtask build --universal
       - name: Package, sign and notarize
         run: |
           mkdir -p release dmg
@@ -138,7 +138,7 @@ jobs:
           dotnet tool install --global AzureSignTool
       - name: Build
         shell: pwsh
-        run: apps/windows/build.ps1 -Target ${{ matrix.target }} -Configuration Release -Publish
+        run: cargo xtask build --target ${{ matrix.target }} --publish
       - name: Sign
         if: env.AZURE_KEY_VAULT_URI != ''
         shell: bash
@@ -198,7 +198,7 @@ jobs:
             echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
           } >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path apps/linux/Cargo.toml
+        run: cargo xtask build --target ${{ matrix.target }}
       - name: Package
         run: |
           NAME=photosink_linux_${{ matrix.arch }}

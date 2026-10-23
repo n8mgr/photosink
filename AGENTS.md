@@ -10,9 +10,10 @@ native app per platform over one Rust core.
 |---|---|
 | `src/` | `photosink` crate: sources, export, state DB, EXIF/XMP writers, consolidate, clean, redate. Emits typed `Event`s through a `Progress` callback. |
 | `bridge/` | `photosink-bridge`: typed window state shared by the apps, exported with UniFFI 0.31. Settings, runs, the status grid (grouping, states, filters) and the Dates picker. No user-facing text. |
-| `apps/macos/` | SwiftUI app (SwiftPM, macOS 26). `build.sh` builds the bridge, generates Swift bindings and assembles `build/Photosink.app`. |
+| `apps/macos/` | SwiftUI app (SwiftPM, macOS 26). `cargo xtask build` builds the bridge, generates Swift bindings and assembles `build/Photosink.app`. |
 | `apps/linux/` | GTK 4 + libadwaita app; its own Cargo workspace using `bridge` as a crate. |
-| `apps/windows/` | WinUI 3 app (C#, .NET 10). `build.ps1` builds the bridge, runs `uniffi-bindgen-cs` and the .NET build. |
+| `apps/windows/` | WinUI 3 app (C#, .NET 10). `cargo xtask build` builds the bridge, runs `uniffi-bindgen-cs` and the .NET build. |
+| `xtask/` | Rust build automation for each platform, invoked through the `cargo xtask` alias. |
 | `.changeset/` | Pending changelog entries for knope. |
 
 ## Rules
@@ -48,12 +49,15 @@ cargo deny check                    # licenses (GPL-3.0 compatible), advisories,
 # Linux app (needs libgtk-4-dev and libadwaita-1-dev on Linux, or brew gtk4 libadwaita adwaita-icon-theme)
 cargo clippy --manifest-path apps/linux/Cargo.toml --all-targets -- -D warnings
 
-# macOS app (Xcode 26+)
-apps/macos/build.sh                 # this Mac's arch, ad-hoc signed
-UNIVERSAL=1 apps/macos/build.sh     # arm64 + x86_64
+# Native app for the current platform (Release)
+cargo xtask build
 
-# Windows app (PowerShell, Rust MSVC, .NET 10 SDK, uniffi-bindgen-cs v0.11.1+v0.31.0)
-apps/windows/build.ps1
+# macOS app (Xcode 26+)
+cargo xtask build                  # this Mac's arch, ad-hoc signed
+cargo xtask build --universal      # arm64 + x86_64
+
+# Windows app (Rust MSVC, .NET 10 SDK, uniffi-bindgen-cs v0.11.1+v0.31.0)
+cargo xtask build
 ```
 
 After changing an exported `bridge` type, rebuild each app so its generated bindings

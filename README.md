@@ -7,12 +7,25 @@ not written twice.
 
 ## Build
 
-Each platform has its own native app over the same Rust core:
+Each platform has its own native app over the same Rust core. From the repository
+root, build the app for your platform with:
 
-- **macOS** (SwiftUI): `apps/macos/build.sh` builds the bridge, generates the Swift
-  bindings, and assembles `apps/macos/build/Photosink.app`.
-- **Linux** (GTK 4 + libadwaita): `cargo run --release --manifest-path apps/linux/Cargo.toml`.
-- **Windows** (WinUI 3): `apps/windows/build.ps1`; see `apps/windows/README.md`.
+```sh
+cargo xtask build
+```
+
+- **macOS** (SwiftUI, Xcode 26+): builds the bridge, generates the Swift bindings,
+  and assembles `apps/macos/build/Photosink.app`. Use `--universal` for arm64 and
+  x86_64 (install both Rust targets first). Signing is ad-hoc by default; set
+  `SIGN_IDENTITY` to sign with a certificate, hardened runtime and entitlements.
+- **Linux** (GTK 4 + libadwaita): builds `apps/linux/target/release/photosink`.
+  Requires `libgtk-4-dev` and `libadwaita-1-dev`. Use `--target <TRIPLE>` to build
+  for another Linux architecture with its toolchain and libraries installed.
+- **Windows** (WinUI 3): builds the bridge, generates the C# bindings, and builds
+  the app. Use `--publish` for self-contained output; see `apps/windows/README.md`.
+
+Builds default to Release. `cargo xtask build --help` lists the platform options.
+The `xtask` crate contains the build automation; Cargo builds it automatically.
 
 The Rust library is the root crate. `bridge` is the window model every app renders:
 settings, tabs, runs, the status grid and its filters, and the Dates picker, exported

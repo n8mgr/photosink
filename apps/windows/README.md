@@ -19,13 +19,18 @@ message and number or date format is built here (`Copy.cs`).
 
 ## Build and run
 
+Run from the repository root:
+
 ```powershell
-.\build.ps1                                    # host architecture, Release
-.\build.ps1 -Target aarch64-pc-windows-msvc    # ARM64
-.\build.ps1 -Publish                           # self-contained app in bin\publish\<rid>
+cargo xtask build                                      # host architecture, Release
+cargo xtask build --target aarch64-pc-windows-msvc      # ARM64
+cargo xtask build --publish                             # self-contained app in apps\windows\bin\publish\<rid>
+cargo xtask build --configuration Debug                 # Debug .NET build
 ```
 
-`build.ps1` builds the bridge DLL, regenerates `Generated\photosink_bridge.cs`
+`cargo xtask build` builds the bridge DLL, regenerates `Generated\photosink_bridge.cs`
 (gitignored) and builds the app with the DLL copied next to `Photosink.exe`.
+The Rust bridge is always built in Release mode.
+Paths below are relative to `apps/windows`.
 Run `bin\<Platform>\Release\net10.0-windows10.0.19041.0\<rid>\Photosink.exe`, or
-open `Photosink.csproj` in Visual Studio after running `build.ps1` once.
+open `Photosink.csproj` in Visual Studio after running `cargo xtask build` once.

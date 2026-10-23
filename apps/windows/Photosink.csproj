@@ -45,7 +45,7 @@
   </Target>
 
   <Target Name="RequireBridge" BeforeTargets="BeforeBuild">
-    <Error Condition="!Exists('$(MSBuildThisFileDirectory)Generated\photosink_bridge.cs')" Text="Generated\photosink_bridge.cs is missing. Run build.ps1, which builds the bridge and generates the bindings." />
-    <Error Condition="!Exists('$(BridgeDll)')" Text="$(BridgeDll) is missing. Run build.ps1, or cargo build --release -p photosink-bridge --target $(BridgeTriple)." />
+    <Error Condition="!Exists('$(MSBuildThisFileDirectory)Generated\photosink_bridge.cs')" Text="Generated\photosink_bridge.cs is missing. Run cargo xtask build from the repository root, which builds the bridge and generates the bindings." />
+    <Error Condition="!Exists('$(BridgeDll)')" Text="$(BridgeDll) is missing. Run cargo xtask build --target $(BridgeTriple) from the repository root, or cargo build --release -p photosink-bridge --target $(BridgeTriple)." />
   </Target>
 </Project>

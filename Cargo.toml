@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [workspace]
-members = ["bridge"]
+members = ["bridge", "xtask"]
 exclude = ["apps"]
 
 [dependencies]
