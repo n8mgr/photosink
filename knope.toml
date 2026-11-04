@@ -1,5 +1,6 @@
 [package]
 changelog = "CHANGELOG.md"
+assets = "release/photosink_*"
 versioned_files = [
     "Cargo.toml",
     "bridge/Cargo.toml",
@@ -50,56 +51,14 @@ template = "chore: prepare release $version"
 variables = { "$version" = "Version" }
 
 [workflows.steps.body]
-template = "This PR was created automatically. Merging it will tag $version, build and sign the apps, and publish the release.\n\n$changelog"
+template = "This PR was created automatically. Merging it will build and sign the apps, then tag $version and publish the release.\n\n$changelog"
 variables = { "$changelog" = "ChangelogEntry", "$version" = "Version" }
-
-[[workflows]]
-name = "tag"
-
-[[workflows.steps]]
-type = "Command"
-command = """
-set -e
-if git rev-parse -q --verify "refs/tags/v$version^{commit}" >/dev/null; then
-  if [ "$(git rev-parse "refs/tags/v$version^{commit}")" != "$(git rev-parse HEAD)" ]; then
-    echo "tag v$version already exists and does not point to HEAD" >&2
-    exit 1
-  fi
-  echo "tag v$version already points to HEAD, skipping"
-else
-  git tag "v$version"
-fi
-git push origin "v$version"
-"""
-shell = true
-variables = { "$version" = "Version" }
 
 [[workflows]]
 name = "release"
 
 [[workflows.steps]]
-type = "Command"
-command = """
-set -e
-NOTES_FILE=$(mktemp)
-awk -v v="$version" '
-  /^## / { if (found) exit; if ($2 == v) { found = 1; next } }
-  found { print }
-' CHANGELOG.md > "$NOTES_FILE"
-if ! [ -s "$NOTES_FILE" ]; then
-  echo "no changelog entry found for $version" >&2
-  exit 1
-fi
-case v$version in *-*) PRERELEASE=--prerelease;; esac
-if gh release view "v$version" >/dev/null 2>&1; then
-  gh release edit "v$version" --title "v$version" --notes-file "$NOTES_FILE" $PRERELEASE
-  gh release upload "v$version" release/* --clobber
-else
-  gh release create "v$version" --title "v$version" --notes-file "$NOTES_FILE" $PRERELEASE release/*
-fi
-"""
-shell = true
-variables = { "$version" = "Version" }
+type = "Release"
 
 [github]
 owner = "n8mgr"

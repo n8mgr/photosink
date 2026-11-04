@@ -16,32 +16,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  tag:
-    name: Tag Release
-    if: "contains(github.event.head_commit.message, 'chore: prepare release')"
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Configure Git
-        run: |
-          git config --global user.name github-actions[bot]
-          git config --global user.email 41898282+github-actions[bot]@users.noreply.github.com
-      - uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
-      - name: Tag release
-        run: knope tag --verbose
-      - name: Read version tag
-        id: version
-        run: echo "version=$(git tag --points-at HEAD --list 'v*' | head -n1)" >> "$GITHUB_OUTPUT"
-
   macos:
     name: Build macOS
-    needs: tag
+    if: "contains(github.event.head_commit.message, 'chore: prepare release')"
     runs-on: macos-26
     timeout-minutes: 45
     permissions:
@@ -55,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.tag.outputs.version }}
+          ref: ${{ github.sha }}
       - name: Setup Rust
         run: |
           rustup update stable
@@ -124,7 +101,7 @@ jobs:
 
   windows:
     name: Build Windows (${{ matrix.arch }})
-    needs: tag
+    if: "contains(github.event.head_commit.message, 'chore: prepare release')"
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
@@ -143,7 +120,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.tag.outputs.version }}
+          ref: ${{ github.sha }}
       - name: Validate signing configuration
         if: env.AZURE_SIGNING_ACCOUNT != ''
         shell: pwsh
@@ -196,15 +173,13 @@ jobs:
           7z a release/photosink_windows_${{ matrix.arch }}.zip ./apps/windows/bin/publish/${{ matrix.rid }}/*
       - name: Build installer
         shell: pwsh
-        env:
-          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           $signArgs = @()
           if ($env:AZURE_SIGNING_ACCOUNT) {
             $signScript = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/sign-windows.ps1'
             $signArgs = @('/DSign', ('/Sartifact=pwsh.exe -NoProfile -File $q{0}$q $f' -f $signScript))
           }
-          $version = $env:VERSION.TrimStart('v')
+          $version = ([xml](Get-Content apps/windows/Photosink.csproj -Raw)).SelectSingleNode('/Project/PropertyGroup/Version').InnerText
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" @signArgs apps/windows/installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -214,8 +189,8 @@ jobs:
 
   linux:
     name: Build Linux (${{ matrix.arch }})
-    needs: tag
-    runs-on: ubuntu-24.04
+    if: "contains(github.event.head_commit.message, 'chore: prepare release')"
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -224,40 +199,25 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
           - arch: aarch64
             target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.tag.outputs.version }}
+          ref: ${{ github.sha }}
       - name: Setup Environment
         run: |
           rustup update stable
           rustup target add ${{ matrix.target }}
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev dpkg-dev
-      - name: Setup cross-compile
-        if: matrix.arch == 'aarch64'
-        run: |
-          # arm64 packages come from ports.ubuntu.com; keep the main archive amd64-only
-          sudo sed -i 's/^Types: deb$/Types: deb\nArchitectures: amd64/' /etc/apt/sources.list.d/ubuntu.sources
-          printf 'Types: deb\nURIs: http://ports.ubuntu.com/ubuntu-ports\nSuites: noble noble-updates noble-security\nComponents: main universe\nArchitectures: arm64\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n' \
-            | sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libgtk-4-dev:arm64 libadwaita-1-dev:arm64
-          {
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
-            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
-            echo "PKG_CONFIG_ALLOW_CROSS=1"
-            echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig"
-          } >> "$GITHUB_ENV"
       - name: Build
         run: cargo xtask build --target ${{ matrix.target }}
       - name: Package
-        env:
-          VERSION: ${{ needs.tag.outputs.version }}
         run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "photosink") | .version')
           NAME=photosink_linux_${{ matrix.arch }}
           mkdir -p "$NAME" release
           cp apps/linux/target/${{ matrix.target }}/release/photosink apps/linux/photosink.desktop apps/linux/photosink.png README.md LICENSE "$NAME/"
@@ -270,14 +230,14 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [tag, macos, windows, linux]
+    needs: [macos, windows, linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.tag.outputs.version }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -288,4 +248,4 @@ jobs:
       - name: Create GitHub release
         run: knope release --verbose
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
