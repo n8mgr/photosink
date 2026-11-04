@@ -478,8 +478,8 @@ mod tests {
         write_archives(dir.path());
         let out = dir.path().join("out");
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}\"\nedits = true",
-            out.display()
+            "export_dir = {}\npath = \"{{take.year}}\"\nedits = true",
+            toml::Value::String(out.to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&dir.path().join("state.sqlite")).unwrap();
@@ -511,8 +511,8 @@ mod tests {
         write_tree(dir.path());
         let out = dir.path().join("out");
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}\"",
-            out.display()
+            "export_dir = {}\npath = \"{{take.year}}\"",
+            toml::Value::String(out.to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&dir.path().join("state.sqlite")).unwrap();

@@ -581,8 +581,8 @@ mod tests {
     fn dates_undated_assets_from_the_file_before_the_upload_time() {
         let out = tempfile::tempdir().unwrap();
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}\"\nembed = false",
-            out.path().display()
+            "export_dir = {}\npath = \"{{take.year}}\"\nembed = false",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&out.path().join("state.sqlite")).unwrap();
@@ -661,8 +661,8 @@ mod tests {
     fn without_sidecar_the_asset_is_read_back_from_the_file() {
         let out = tempfile::tempdir().unwrap();
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}\"\nsidecar = false",
-            out.path().display()
+            "export_dir = {}\npath = \"{{take.year}}\"\nsidecar = false",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&out.path().join("state.sqlite")).unwrap();
@@ -697,8 +697,8 @@ mod tests {
     /// under a `{take.date}_{keyword:0}_{stem}` filename, filtered to beach.
     fn export_templated(out: &Path) -> (State, Summary) {
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}\"\nfilename = \"{{take.date}}_{{keyword:0}}_{{stem}}\"\nembed = false\nconcurrency = 1\n[filter]\nkeywords = [\"beach\"]",
-            out.display()
+            "export_dir = {}\npath = \"{{take.year}}\"\nfilename = \"{{take.date}}_{{keyword:0}}_{{stem}}\"\nembed = false\nconcurrency = 1\n[filter]\nkeywords = [\"beach\"]",
+            toml::Value::String(out.to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&out.join("state.sqlite")).unwrap();
@@ -764,8 +764,8 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let (state, _) = export_templated(out.path());
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}\"\nfilename = \"{{stem}}\"\nembed = false",
-            out.path().display()
+            "export_dir = {}\npath = \"{{take.year}}\"\nfilename = \"{{stem}}\"\nembed = false",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
         ))
         .unwrap();
         let c = crate::consolidate::run(&cfg, &state, &|e| eprintln!("{e}"), false).unwrap();
@@ -779,8 +779,8 @@ mod tests {
     fn dry_run_plans_without_touching_anything() {
         let out = tempfile::tempdir().unwrap();
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}/{{keyword:0}}\"",
-            out.path().display()
+            "export_dir = {}\npath = \"{{take.year}}/{{keyword:0}}\"",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&out.path().join("state.sqlite")).unwrap();
@@ -804,7 +804,7 @@ mod tests {
         assert_eq!((s.exported, s.skipped, s.errors), (1, 0, 0));
         assert!(
             log.iter().any(
-                |e| matches!(e, Event::Placed { dest, .. } if dest == "2001/beach/IMG_1.HEIC")
+                |e| matches!(e, Event::Placed { dest, .. } if Path::new(dest) == Path::new("2001/beach/IMG_1.HEIC"))
             ),
             "{log:?}"
         );
@@ -827,8 +827,8 @@ mod tests {
     fn exports_dedups_and_skips_on_rerun() {
         let out = tempfile::tempdir().unwrap();
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}/{{keyword:0}}\"\nconcurrency = 1\nedits = true",
-            out.path().display()
+            "export_dir = {}\npath = \"{{take.year}}/{{keyword:0}}\"\nconcurrency = 1\nedits = true",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
         ))
         .unwrap();
         let state = State::open(&out.path().join("state.sqlite")).unwrap();

@@ -21,7 +21,7 @@ OutputBaseFilename=photosink_windows_x64_setup
 Compression=lzma2
 SolidCompression=yes
 #ifdef Sign
-SignTool=azure
+SignTool=artifact
 SignedUninstaller=yes
 #endif
 

@@ -9,7 +9,7 @@ message and number or date format is built here (`Copy.cs`).
 - Rust with the MSVC toolchain (`rustup default stable-msvc`); for ARM64 builds also
   `rustup target add aarch64-pc-windows-msvc` and the Visual Studio ARM64 build tools.
 - .NET 10 SDK.
-- Windows App SDK 2.5 (pulled from NuGet by the build; the app is self-contained and
+- Windows App SDK 2.6 (pulled from NuGet by the build; the app is self-contained and
   unpackaged, so no runtime install is needed).
 - uniffi-bindgen-cs matching uniffi 0.31:
 
