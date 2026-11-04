@@ -62,6 +62,9 @@ jobs:
 
           # resync system clock https://github.com/actions/runner/issues/2996#issuecomment-1833103110
           sudo sntp -sS time.windows.com
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
       - name: Build
         env:
           SIGN_IDENTITY: ${{ env.APPLE_CERT_ID }}
@@ -139,12 +142,21 @@ jobs:
           dotnet-version: |
             8.0.x
             10.0.x
-      - name: Setup
+      - name: Setup Rust
         shell: pwsh
         run: |
           rustup update stable
           rustup target add ${{ matrix.target }}
-          cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.1+v0.31.0 --locked
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: publish-${{ matrix.target }}
+          cache-on-failure: true
+      - name: Install uniffi-bindgen-cs
+        shell: pwsh
+        run: |
+          if (-not (Get-Command uniffi-bindgen-cs -ErrorAction SilentlyContinue)) {
+            cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.1+v0.31.0
+          }
       - name: Build
         shell: pwsh
         env:
@@ -213,6 +225,13 @@ jobs:
           rustup target add ${{ matrix.target }}
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev dpkg-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: publish-${{ matrix.target }}
+          workspaces: |
+            .
+            apps/linux
+          cache-on-failure: true
       - name: Build
         run: cargo xtask build --target ${{ matrix.target }}
       - name: Package

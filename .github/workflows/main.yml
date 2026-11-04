@@ -97,7 +97,9 @@ jobs:
           rustup update stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          workspaces: apps/linux
+          workspaces: |
+            .
+            apps/linux
       - name: Build
         run: cargo xtask build
 
@@ -118,7 +120,7 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Get-Command uniffi-bindgen-cs -ErrorAction SilentlyContinue)) {
-            cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.1+v0.31.0 --locked
+            cargo install uniffi-bindgen-cs --git https://github.com/NordSecurity/uniffi-bindgen-cs --tag v0.11.1+v0.31.0
           }
       - name: Build
         shell: pwsh
