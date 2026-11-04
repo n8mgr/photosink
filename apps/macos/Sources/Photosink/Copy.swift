@@ -411,6 +411,7 @@ extension SettingsProblem {
         case let .unknownFields(template, names):
             "\(template.name) uses unknown \(names.count == 1 ? "field" : "fields") \(names.joined(separator: ", "))"
         case .fromAfterTo: "filter.from is after filter.to"
+        case let .checkInterval(minutes): "Check interval \(minutes.formatted()) must be between 1 and \(1440.formatted()) minutes."
         }
     }
 }

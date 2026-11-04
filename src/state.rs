@@ -183,6 +183,10 @@ impl State {
         exported(&self.conn(), uuid, kind)
     }
 
+    pub(crate) fn revision(&self, uuid: &str, kind: Kind) -> Result<Option<String>> {
+        self.get(&format!("revision:{uuid}:{}", kind.name()))
+    }
+
     #[cfg(test)]
     pub(crate) fn record(&self, uuid: &str, kind: Kind, hash: &str, path: &str) -> Result<()> {
         record(&self.conn(), uuid, kind, hash, path)
@@ -198,10 +202,12 @@ impl State {
         kind: Kind,
         hash: &str,
         tmp: &Path,
+        revision: Option<&str>,
         dest: impl FnOnce() -> Result<Placed>,
     ) -> Result<Placed> {
-        let conn = self.conn();
-        let placed = match duplicate(&conn, hash)? {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let placed = match duplicate(&tx, hash)? {
             Some(path) => {
                 std::fs::remove_file(tmp)?;
                 Placed::Duplicate(path)
@@ -209,7 +215,17 @@ impl State {
             None => dest()?,
         };
         let (Placed::New(path) | Placed::Duplicate(path)) = &placed;
-        record(&conn, uuid, kind, hash, path)?;
+        record(&tx, uuid, kind, hash, path)?;
+        let key = format!("revision:{uuid}:{}", kind.name());
+        if let Some(revision) = revision {
+            tx.execute(
+                "INSERT OR REPLACE INTO kv VALUES (?, ?)",
+                [key, revision.to_owned()],
+            )?;
+        } else {
+            tx.execute("DELETE FROM kv WHERE key = ?", [key])?;
+        }
+        tx.commit()?;
         Ok(placed)
     }
 }
@@ -243,13 +259,14 @@ fn record(conn: &Connection, uuid: &str, kind: Kind, hash: &str, path: &str) -> 
 }
 
 fn duplicate(conn: &Connection, hash: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT path FROM exports WHERE hash = ? LIMIT 1",
-            [hash],
-            |r| r.get(0),
-        )
-        .optional()?)
+    let mut stmt = conn.prepare("SELECT path FROM exports WHERE hash = ?")?;
+    for path in stmt.query_map([hash], |r| r.get::<_, String>(0))? {
+        let path = path?;
+        if Path::new(&path).is_file() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -279,7 +296,7 @@ mod tests {
         assert_eq!(s.duplicate("h").unwrap(), None);
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("u", Kind::Original, "h", &tmp, || mv(&dest))
+            s.place("u", Kind::Original, "h", &tmp, None, || mv(&dest))
                 .unwrap(),
             Placed::New(dest.to_string_lossy().into_owned())
         );
@@ -292,12 +309,56 @@ mod tests {
         assert_eq!(s.duplicate("h").unwrap().as_deref(), dest.to_str());
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("v", Kind::Original, "h", &tmp, || unreachable!())
+            s.place("v", Kind::Original, "h", &tmp, None, || unreachable!())
                 .unwrap(),
             Placed::Duplicate(dest.to_string_lossy().into_owned())
         );
         assert!(!tmp.exists());
         assert!(s.exported("v", Kind::Original).unwrap().is_some());
+    }
+
+    #[test]
+    fn revisions_follow_successfully_placed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::from_conn(Connection::open_in_memory().unwrap()).unwrap();
+        let tmp = dir.path().join("part");
+        let old = dir.path().join("old.jpg");
+        let new = dir.path().join("new.jpg");
+        std::fs::write(&tmp, b"old").unwrap();
+        state
+            .place("u", Kind::Original, "old", &tmp, Some("1"), || {
+                std::fs::rename(&tmp, &old)?;
+                Ok(Placed::New(old.to_string_lossy().into_owned()))
+            })
+            .unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+        assert!(
+            state
+                .place("u", Kind::Original, "new", &tmp, Some("2"), || {
+                    anyhow::bail!("placement failed")
+                })
+                .is_err()
+        );
+        assert_eq!(
+            state.revision("u", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            state.exported("u", Kind::Original).unwrap().as_deref(),
+            old.to_str()
+        );
+        state
+            .place("u", Kind::Original, "new", &tmp, None, || {
+                std::fs::rename(&tmp, &new)?;
+                Ok(Placed::New(new.to_string_lossy().into_owned()))
+            })
+            .unwrap();
+        assert_eq!(state.revision("u", Kind::Original).unwrap(), None);
+        assert_eq!(
+            state.exported("u", Kind::Original).unwrap().as_deref(),
+            new.to_str()
+        );
+        assert_eq!(std::fs::read(old).unwrap(), b"old");
     }
 
     #[test]

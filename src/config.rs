@@ -1,7 +1,9 @@
 use crate::photo::{DateZone, Filter};
 use anyhow::{Context, Result};
 use directories::{BaseDirs, ProjectDirs};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +32,25 @@ pub struct Config {
     pub onedrive_client_id: String,
     #[serde(default)]
     pub dropbox_app_key: String,
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default = "default_check_interval")]
+    pub check_interval_minutes: u32,
+    #[serde(default)]
+    pub keep_running_after_close: bool,
+    #[serde(default)]
+    pub sources: HashMap<String, SourceSettings>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SourceSettings {
+    pub arg: String,
+    pub automatic: bool,
+}
+
+fn default_check_interval() -> u32 {
+    15
 }
 
 fn default_true() -> bool {
@@ -68,6 +89,19 @@ impl Config {
         let mut cfg: Config = toml::from_str(s)?;
         cfg.export_dir = expand_home(&cfg.export_dir);
         anyhow::ensure!(cfg.concurrency > 0, "concurrency must be > 0");
+        anyhow::ensure!(
+            (1..=1440).contains(&cfg.check_interval_minutes),
+            "check_interval_minutes must be between 1 and 1440"
+        );
+        for source in cfg.sources.keys() {
+            anyhow::ensure!(
+                matches!(
+                    source.as_str(),
+                    "apple-photos" | "onedrive" | "dropbox" | "google-takeout"
+                ),
+                "unknown source {source}"
+            );
+        }
         for (what, tpl) in [("path", &cfg.path), ("filename", &cfg.filename)] {
             let unknown = crate::template::unknown(tpl, &crate::photo::field_names());
             anyhow::ensure!(
@@ -122,7 +156,13 @@ pub fn update(path: &Path, set: impl FnOnce(&mut toml::Table)) -> Result<()> {
     set(&mut table);
     let text = toml::to_string(&table)?;
     Config::parse(&text)?;
-    std::fs::write(path, text)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(text.as_bytes())?;
+    file.persist(path)?;
     Ok(())
 }
 
@@ -171,6 +211,10 @@ mod tests {
         assert_eq!(cfg.filename, "{stem}");
         assert_eq!(cfg.concurrency, 4);
         assert!(!cfg.edits);
+        assert!(!cfg.automatic);
+        assert!(!cfg.keep_running_after_close);
+        assert_eq!(cfg.check_interval_minutes, 15);
+        assert!(cfg.sources.is_empty());
     }
 
     #[test]
@@ -216,5 +260,14 @@ mod tests {
     fn rejects_unknown_and_zero() {
         assert!(Config::parse("export_dir = \"/o\"\nbogus = 1").is_err());
         assert!(Config::parse("export_dir = \"/o\"\nconcurrency = 0").is_err());
+        for minutes in [0, 1441] {
+            assert!(
+                Config::parse(&format!(
+                    "export_dir = '/o'\ncheck_interval_minutes = {minutes}"
+                ))
+                .is_err()
+            );
+        }
+        assert!(Config::parse("export_dir = '/o'\n[sources.clean]\nautomatic = true").is_err());
     }
 }

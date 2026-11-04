@@ -59,6 +59,10 @@ pub struct SettingsPanel {
     filter_group: adw::PreferencesGroup,
     edits: Vec<(bool, gtk::ToggleButton)>,
     metadata: Vec<(Metadata, gtk::ToggleButton)>,
+    automatic: adw::SwitchRow,
+    interval: adw::SpinRow,
+    keep_running: adw::SwitchRow,
+    open_at_login: adw::SwitchRow,
 }
 
 impl Template {
@@ -461,6 +465,15 @@ impl SettingsPanel {
         for (v, b) in &self.metadata {
             b.set_active(*v == s.metadata);
         }
+        self.automatic.set_active(s.automatic);
+        self.interval.set_value(f64::from(s.check_interval_minutes));
+        self.keep_running.set_active(s.keep_running_after_close);
+        match crate::startup::enabled() {
+            Ok(enabled) => self.open_at_login.set_active(enabled),
+            Err(e) => self
+                .toaster
+                .show(format!("Could not read login settings: {e}")),
+        }
         self.state.replace(Some(s.clone()));
         self.saved.replace(Some(s));
         self.loading.set(false);
@@ -510,6 +523,39 @@ impl SettingsPanel {
     }
 
     fn connect(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.automatic.connect_active_notify(move |row| {
+            if let Some(panel) = weak.upgrade() {
+                panel.edit(|s| s.automatic = row.is_active());
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.interval.connect_value_notify(move |row| {
+            if let Some(panel) = weak.upgrade() {
+                panel.edit(|s| s.check_interval_minutes = row.value() as u32);
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.keep_running.connect_active_notify(move |row| {
+            if let Some(panel) = weak.upgrade() {
+                panel.edit(|s| s.keep_running_after_close = row.is_active());
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.open_at_login.connect_active_notify(move |row| {
+            let Some(panel) = weak.upgrade() else { return };
+            if panel.loading.get() {
+                return;
+            }
+            if let Err(e) = crate::startup::set_enabled(row.is_active()) {
+                panel
+                    .toaster
+                    .show(format!("Could not change login settings: {e}"));
+                panel.loading.set(true);
+                row.set_active(!row.is_active());
+                panel.loading.set(false);
+            }
+        });
         let weak = Rc::downgrade(self);
         self.export_button.connect_clicked(move |_| {
             if let Some(panel) = weak.upgrade() {
@@ -716,7 +762,29 @@ impl SettingsPanel {
             metadata_row.upcast_ref(),
         ]));
 
-        for p in [&layout, &dates, &filter, &files] {
+        let automation = page("Automation", "alarm-symbolic");
+        let automatic = adw::SwitchRow::builder()
+            .title("Enable automatic exports")
+            .subtitle("Select Export automatically on each source to include it. Uses your saved export settings; dry run does not apply.")
+            .build();
+        let interval = adw::SpinRow::builder()
+            .title("Check every (minutes)")
+            .adjustment(&gtk::Adjustment::new(15.0, 1.0, 1440.0, 1.0, 15.0, 0.0))
+            .numeric(true)
+            .build();
+        let keep_running = adw::SwitchRow::builder()
+            .title("Keep running after close")
+            .subtitle("Reopen Photosink to see progress. Choose Quit to stop it.")
+            .build();
+        let open_at_login = adw::SwitchRow::builder().title("Open at login").build();
+        automation.add(&group_of(&[
+            automatic.upcast_ref(),
+            interval.upcast_ref(),
+            keep_running.upcast_ref(),
+            open_at_login.upcast_ref(),
+        ]));
+
+        for p in [&layout, &dates, &filter, &files, &automation] {
             root.add(p);
         }
 
@@ -750,6 +818,10 @@ impl SettingsPanel {
             filter_group,
             edits,
             metadata,
+            automatic,
+            interval,
+            keep_running,
+            open_at_login,
         });
         panel.load();
         panel.connect();
@@ -757,7 +829,19 @@ impl SettingsPanel {
     }
 
     pub fn present(&self, parent: &impl IsA<gtk::Widget>) {
+        self.loading.set(true);
+        if let Ok(enabled) = crate::startup::enabled() {
+            self.open_at_login.set_active(enabled);
+        }
+        self.loading.set(false);
         self.root.present(Some(parent));
+    }
+
+    pub fn keep_running_after_close(&self) -> bool {
+        self.saved
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| s.keep_running_after_close)
     }
 
     /// Called after every successful save.

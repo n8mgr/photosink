@@ -1,4 +1,4 @@
-use super::super::{Kind, Resource};
+use super::super::{AuthMode, Kind, Resource};
 use anyhow::{Result, anyhow, bail};
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -24,30 +24,38 @@ fn kind(t: PHAssetResourceType) -> Option<Kind> {
     })
 }
 
-pub(crate) fn authorize() -> Result<()> {
-    let (tx, rx) = mpsc::channel();
-    let handler = RcBlock::new(move |status: PHAuthorizationStatus| {
-        let _ = tx.send(status);
-    });
-    unsafe {
-        PHPhotoLibrary::requestAuthorizationForAccessLevel_handler(
-            PHAccessLevel::ReadWrite,
-            &handler,
-        )
+pub(crate) fn authorize(auth: AuthMode) -> Result<()> {
+    let status = if auth == AuthMode::Unattended {
+        unsafe { PHPhotoLibrary::authorizationStatusForAccessLevel(PHAccessLevel::ReadWrite) }
+    } else {
+        let (tx, rx) = mpsc::channel();
+        let handler = RcBlock::new(move |status: PHAuthorizationStatus| {
+            let _ = tx.send(status);
+        });
+        unsafe {
+            PHPhotoLibrary::requestAuthorizationForAccessLevel_handler(
+                PHAccessLevel::ReadWrite,
+                &handler,
+            )
+        };
+        rx.recv()?
     };
-    match rx.recv()? {
+    match status {
         PHAuthorizationStatus::Authorized => Ok(()),
         s => bail!("photo library access not granted (status {})", s.0),
     }
 }
 
-pub(crate) fn list_assets() -> Vec<(String, String)> {
+pub(crate) fn list_assets() -> Vec<(String, String, Option<String>)> {
     let result = unsafe { PHAsset::fetchAssetsWithOptions(None) };
     (0..unsafe { result.count() })
         .map(|i| {
-            let id = unsafe { result.objectAtIndex(i).localIdentifier() }.to_string();
+            let asset = unsafe { result.objectAtIndex(i) };
+            let id = unsafe { asset.localIdentifier() }.to_string();
             let uuid = id.split('/').next().unwrap_or("").to_owned();
-            (uuid, id)
+            let revision = unsafe { asset.modificationDate() }
+                .map(|date| date.timeIntervalSince1970().to_string());
+            (uuid, id, revision)
         })
         .collect()
 }

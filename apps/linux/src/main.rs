@@ -2,6 +2,7 @@ mod copy;
 mod dates_view;
 mod lazy_list;
 mod settings_panel;
+mod startup;
 mod status_view;
 mod tab_page;
 mod ui;
@@ -34,7 +35,10 @@ fn about(win: &window::Window) {
 }
 
 fn activate(app: &adw::Application) {
-    if let Some(win) = app.active_window() {
+    if let Some(win) = app
+        .active_window()
+        .or_else(|| app.windows().into_iter().next())
+    {
         win.present();
         return;
     }
@@ -62,8 +66,12 @@ fn activate(app: &adw::Application) {
             }
         })
         .build();
-    app.add_action_entries([preferences, about_action]);
+    let quit = gio::ActionEntry::builder("quit")
+        .activate(|app: &adw::Application, _, _| app.quit())
+        .build();
+    app.add_action_entries([preferences, about_action, quit]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
 
     win.window.present();
     gtk::glib::spawn_future_local(async move {

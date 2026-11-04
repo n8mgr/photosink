@@ -68,6 +68,33 @@ By default only originals, RAW alternates, and Live Photo videos are exported. `
 adds the rendered edit and the `.AAE` adjustment data, which only Apple Photos (or the
 app that made the edit) can reapply.
 
+### Automatic exports
+
+Enable **Export automatically** on each source you want checked, then turn on automatic
+exports in **Settings → Automation**. The default interval is 15 minutes and can be set
+from 1 minute to 24 hours. Library and folder selections are saved between launches.
+Automatic runs use the saved export settings, always write changes rather than performing
+a dry run, and wait for any current export or maintenance operation to finish.
+
+**Keep running after close** leaves Photosink checking in the background. On macOS, use
+the menu bar item to reopen the window, open Settings, or quit; Windows provides a
+notification-area icon, and Linux reopens the existing window when launched again.
+**Open at login** starts the app when you sign in. Both options are off by default.
+Quitting the app stops automatic checks; it does not run as a system service.
+
+Run each source manually once to grant Photos access or sign in. OneDrive and Dropbox
+reuse saved refresh tokens, so they normally do not need another sign-in. Automatic runs
+report missing or revoked access in the source's log without opening a sign-in prompt.
+Takeout checks the configured local archives or extracted directory; it does not request
+new Google exports.
+
+Apple Photos, OneDrive and Dropbox track source revisions to export changed media as well
+as new items. Previous exported versions are retained, and source deletions do not delete
+local exports. Metadata is refreshed for assets visited by a check. Apple Photos checks
+the system photo library; only one library or folder per source can be selected at a time.
+The asset's base XMP sidecar describes its current metadata. Suffixed media versions
+share that sidecar; enable embedded metadata for tools that require metadata in each file.
+
 ### Apple Photos
 
 Select the system photo library. The default path is

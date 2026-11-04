@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 struct CommitField: View {
@@ -160,6 +161,47 @@ struct OptionalDate: View {
     }
 }
 
+struct LoginItemToggle: View {
+    @State private var status = SMAppService.mainApp.status
+    @State private var error: String?
+
+    private func setEnabled(_ enabled: Bool) {
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+        status = SMAppService.mainApp.status
+    }
+
+    var body: some View {
+        Toggle("Open at login", isOn: Binding(
+            get: { status == .enabled || status == .requiresApproval },
+            set: setEnabled
+        ))
+        .onAppear { status = SMAppService.mainApp.status }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            status = SMAppService.mainApp.status
+        }
+        if status == .requiresApproval {
+            LabeledContent {
+                Button("Open Login Items Settings") { SMAppService.openSystemSettingsLoginItems() }
+            } label: {
+                Text("Approval required")
+                Text("Allow Photosink in System Settings to open it at login.")
+            }
+        }
+        if let error {
+            Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+        }
+    }
+}
+
 struct SettingsWindow: View {
     @Environment(AppModel.self) private var model
 
@@ -169,6 +211,7 @@ struct SettingsWindow: View {
             SwiftUI.Tab("Dates", systemImage: "calendar") { page { dates($0) } }
             SwiftUI.Tab("Filter", systemImage: "line.3.horizontal.decrease") { page { filter($0) } }
             SwiftUI.Tab("Files", systemImage: "doc.on.doc") { page { files($0) } }
+            SwiftUI.Tab("Automation", systemImage: "arrow.triangle.2.circlepath") { page { automation($0) } }
         }
         .frame(width: 600)
         .scenePadding()
@@ -291,6 +334,29 @@ struct SettingsWindow: View {
                 Text("Metadata")
                 Text(Metadata.hint)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func automation(_ s: Settings) -> some View {
+        SwiftUI.Section {
+            Toggle("Export automatically", isOn: Binding(get: { s.automatic }, set: { v in set(s) { $0.automatic = v } }))
+            Stepper("Check every \(s.checkIntervalMinutes.formatted()) \(s.checkIntervalMinutes == 1 ? "minute" : "minutes")", value: Binding(
+                get: { Int(s.checkIntervalMinutes) },
+                set: { v in set(s) { $0.checkIntervalMinutes = UInt32(v) } }
+            ), in: 1...1440)
+            .disabled(!s.automatic)
+        } footer: {
+            Text("Select Export automatically on each source to include it. Automatic checks export files using your saved settings and filters.")
+        }
+        SwiftUI.Section {
+            Toggle("Keep running after closing the window", isOn: Binding(
+                get: { s.keepRunningAfterClose },
+                set: { v in set(s) { $0.keepRunningAfterClose = v } }
+            ))
+            LoginItemToggle()
+        } footer: {
+            Text("When kept running, Photosink stays in the menu bar after its window closes. Choose Quit Photosink to stop it.")
         }
     }
 }

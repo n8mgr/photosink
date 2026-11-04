@@ -28,7 +28,7 @@ struct Sidebar: View {
                         ForEach(tabs, id: \.self) { t in
                             Label(t.name, systemImage: t.symbol)
                                 .tag(t)
-                                .selectionDisabled(model.running && t != model.tab)
+                                .selectionDisabled(model.running && t != model.runningTab)
                         }
                     }
                 }
@@ -43,6 +43,14 @@ struct TabInputs: View {
 
     private var arg: Binding<String> {
         Binding(get: { model.args.arg }, set: { v in var a = model.args; a.arg = v; model.setArgs(a) })
+    }
+
+    private var automatic: some View {
+        Toggle("Export automatically", isOn: Binding(
+            get: { model.args.automatic },
+            set: { v in var a = model.args; a.automatic = v; model.setArgs(a) }
+        ))
+        .help("Include this source when automatic exports are enabled in Settings")
     }
 
     private func setArg(_ url: URL) {
@@ -102,18 +110,22 @@ struct TabInputs: View {
             case .applePhotos:
                 inputs("Library", hint: Tab.applePhotos.hint) {
                     field("Library", "Photos library", choose: chooseLibrary)
+                    automatic
                 }
             case .oneDrive:
                 inputs("Folder", hint: Tab.oneDrive.hint) {
                     field("Folder", "Folder under the drive root; empty for the whole drive")
+                    automatic
                 }
             case .dropbox:
                 inputs("Folder", hint: Tab.dropbox.hint) {
                     field("Folder", "Folder in your Dropbox; empty for everything")
+                    automatic
                 }
             case .googleTakeout:
                 inputs("Takeout", hint: Tab.googleTakeout.hint) {
                     field("Takeout", "Folder of archives, a single archive, or an extracted tree", choose: chooseTakeout)
+                    automatic
                 }
             case .consolidate:
                 inputs(nil, hint: Tab.consolidate.hint) {}
@@ -271,17 +283,58 @@ struct TabDetail: View {
 }
 
 struct MainView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+    let delegate: Delegate
+
     var body: some View {
         NavigationSplitView {
             Sidebar()
         } detail: {
             TabDetail()
         }
+        .onAppear {
+            delegate.model = model
+            delegate.openMainWindow = { [openWindow] in openWindow(id: "main") }
+        }
     }
 }
 
+@MainActor
 final class Delegate: NSObject, NSApplicationDelegate {
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    weak var model: AppModel?
+    var openMainWindow: (() -> Void)?
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        model?.settings?.keepRunningAfterClose != true
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows {
+            openMainWindow?()
+            return false
+        }
+        return true
+    }
+}
+
+struct BackgroundMenu: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Button("Open Photosink") {
+            openWindow(id: "main")
+            NSApp.activate()
+        }
+        Button("Settings…") {
+            openSettings()
+            NSApp.activate()
+        }
+        Divider()
+        Button("Quit Photosink") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
+    }
 }
 
 @main
@@ -291,12 +344,15 @@ struct PhotosinkApp: App {
 
     var body: some Scene {
         Window("Photosink", id: "main") {
-            MainView().environment(model)
+            MainView(delegate: delegate).environment(model)
         }
         .defaultSize(width: 1000, height: 700)
         .windowResizability(.contentMinSize)
         SwiftUI.Settings {
             SettingsWindow().environment(model)
+        }
+        MenuBarExtra("Photosink", systemImage: "photo.on.rectangle.angled") {
+            BackgroundMenu()
         }
     }
 }

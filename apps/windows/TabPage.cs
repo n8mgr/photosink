@@ -201,6 +201,17 @@ internal sealed partial class TabPage : Grid
                 AddArg(args, "Find", "Leave empty to list only assets whose date disagrees with the file", "\uE721", null, true);
                 break;
         }
+        if (tab is Tab.ApplePhotos or Tab.OneDrive or Tab.Dropbox or Tab.GoogleTakeout)
+        {
+            var automatic = new ToggleSwitch { IsOn = args.Automatic };
+            automatic.Toggled += (_, _) => EditArgs(a => a with { Automatic = automatic.IsOn });
+            form.Children.Add(new SettingsCard
+            {
+                Header = "Export automatically",
+                HeaderIcon = new FontIcon { Glyph = "\uE823" },
+                Content = automatic,
+            });
+        }
     }
 
     private void AddArg(RunArgs args, string label, string description, string glyph, Func<TextBox, FrameworkElement>? browse, bool runOnEnter)
@@ -358,8 +369,15 @@ internal sealed partial class TabPage : Grid
         var next = change(args);
         if (next != args)
         {
-            core.SetRunArgs(tab, next);
-            RefreshTask();
+            try
+            {
+                core.SetRunArgs(tab, next);
+                RefreshTask();
+            }
+            catch (CoreException e)
+            {
+                ShowError(Copy.ErrorText(e, tab));
+            }
         }
     }
 

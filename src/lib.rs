@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use config::Config;
 use directories::ProjectDirs;
 use export::Summary;
+use sources::AuthMode;
 #[cfg(target_os = "macos")]
 use sources::apple_photos;
 use state::State;
@@ -334,14 +335,33 @@ impl App {
 
     #[cfg(target_os = "macos")]
     pub fn apple_photos(&self, library: &Path, progress: Progress, dry: bool) -> Result<Summary> {
+        self.apple_photos_with_auth(library, progress, dry, AuthMode::Interactive)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn apple_photos_with_auth(
+        &self,
+        library: &Path,
+        progress: Progress,
+        dry: bool,
+        auth: AuthMode,
+    ) -> Result<Summary> {
         let library = config::expand_home(library);
-        let assets = apple_photos::library::load(&library, progress)?;
+        let mut assets = apple_photos::library::load(&library, progress)?;
         progress(Event::Found {
             total: assets.len(),
             place: library.display().to_string(),
         });
-        apple_photos::photokit::authorize()?;
-        let ids = apple_photos::photokit::list_assets();
+        apple_photos::photokit::authorize(auth)?;
+        let ids: Vec<_> = apple_photos::photokit::list_assets()
+            .into_iter()
+            .map(|(uuid, local_id, revision)| {
+                if let Some(asset) = assets.get_mut(&uuid) {
+                    asset.revision = revision;
+                }
+                (uuid, local_id)
+            })
+            .collect();
         progress(Event::Visible { total: ids.len() });
         Ok(export::run(
             &apple_photos::PhotoKit,
@@ -355,22 +375,44 @@ impl App {
     }
 
     pub fn onedrive(&self, folder: &str, progress: Progress, dry: bool) -> Result<Summary> {
+        self.onedrive_with_auth(folder, progress, dry, AuthMode::Interactive)
+    }
+
+    pub fn onedrive_with_auth(
+        &self,
+        folder: &str,
+        progress: Progress,
+        dry: bool,
+        auth: AuthMode,
+    ) -> Result<Summary> {
         let folder = folder.trim().trim_matches('/');
         let src = sources::onedrive::OneDrive::connect(
             &self.cfg.onedrive_client_id,
             &self.dirs.data_dir().join("onedrive_token.json"),
             progress,
+            auth,
         )?;
-        let key = format!("onedrive_delta:{folder}");
+        let key = format!("onedrive_delta:v2:{folder}");
         self.export_changes(&src, &key, |c| src.list(folder, c), progress, dry)
     }
 
     pub fn dropbox(&self, folder: &str, progress: Progress, dry: bool) -> Result<Summary> {
+        self.dropbox_with_auth(folder, progress, dry, AuthMode::Interactive)
+    }
+
+    pub fn dropbox_with_auth(
+        &self,
+        folder: &str,
+        progress: Progress,
+        dry: bool,
+        auth: AuthMode,
+    ) -> Result<Summary> {
         let folder = folder.trim().trim_matches('/');
         let src = sources::dropbox::Dropbox::connect(
             &self.cfg.dropbox_app_key,
             &self.dirs.data_dir().join("dropbox_token.json"),
             progress,
+            auth,
         )?;
         let key = format!("dropbox_cursor:{folder}");
         self.export_changes(&src, &key, |c| src.list(folder, c), progress, dry)

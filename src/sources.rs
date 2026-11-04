@@ -11,6 +11,12 @@ use anyhow::Result;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    Interactive,
+    Unattended,
+}
+
 const IMAGES: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tif", "tiff", "dng", "cr2", "cr3", "nef",
     "arw", "raf", "orf", "rw2",

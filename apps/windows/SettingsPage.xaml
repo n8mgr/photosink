@@ -110,6 +110,26 @@
                         </tk:SettingsCard>
                     </tk:SettingsExpander.Items>
                 </tk:SettingsExpander>
+
+                <tk:SettingsExpander Header="Automation">
+                    <tk:SettingsExpander.HeaderIcon>
+                        <FontIcon Glyph="&#xE823;" />
+                    </tk:SettingsExpander.HeaderIcon>
+                    <tk:SettingsExpander.Items>
+                        <tk:SettingsCard Header="Enable automatic exports" Description="Select Export automatically on each source to include it. Uses your saved export settings; dry run does not apply.">
+                            <ToggleSwitch x:Name="AutomaticSwitch" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Check every (minutes)">
+                            <NumberBox x:Name="IntervalBox" Minimum="1" Maximum="1440" SmallChange="1" LargeChange="15" SpinButtonPlacementMode="Inline" Width="160" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Keep running after close" Description="Use the notification area icon to reopen Photosink or quit.">
+                            <ToggleSwitch x:Name="KeepRunningSwitch" />
+                        </tk:SettingsCard>
+                        <tk:SettingsCard Header="Open at login">
+                            <ToggleSwitch x:Name="OpenAtLoginSwitch" />
+                        </tk:SettingsCard>
+                    </tk:SettingsExpander.Items>
+                </tk:SettingsExpander>
             </StackPanel>
         </StackPanel>
     </ScrollViewer>
