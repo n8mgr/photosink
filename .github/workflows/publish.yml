@@ -53,7 +53,6 @@ jobs:
       APPLE_KEY_B64: ${{ secrets.APPLE_KEY_B64 }}
       APPLE_CERT_B64: ${{ secrets.APPLE_CERT_B64 }}
       APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-      APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,41 +62,62 @@ jobs:
           rustup update stable
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Setup signing
-        if: env.APPLE_CERT_B64 != ''
         run: |
+          for name in APPLE_CERT_ID APPLE_API_KEY APPLE_API_ISSUER APPLE_KEY_B64 APPLE_CERT_B64 APPLE_CERT_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing required release secret: $name"
+              exit 1
+            fi
+          done
+          umask 077
           APPLE_CERT_PATH="$RUNNER_TEMP/apple_cert.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
-          echo -n "$APPLE_CERT_B64" | base64 --decode --output "$APPLE_CERT_PATH"
-
-          mkdir -p ~/private_keys
-          echo -n "$APPLE_KEY_B64" | base64 --decode --output ~/private_keys/"AuthKey_$APPLE_API_KEY.p8"
+          APPLE_KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
+          printf '%s' "$APPLE_CERT_B64" | base64 --decode > "$APPLE_CERT_PATH"
+          printf '%s' "$APPLE_KEY_B64" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
 
           security create-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security default-keychain -s "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$APPLE_CERT_PATH" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security import "$APPLE_CERT_PATH" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
           security find-identity -v "$KEYCHAIN_PATH" -p codesigning
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           # resync system clock https://github.com/actions/runner/issues/2996#issuecomment-1833103110
           sudo sntp -sS time.windows.com
       - name: Build
-        run: |
-          if [ -n "$APPLE_CERT_B64" ]; then export SIGN_IDENTITY="$APPLE_CERT_ID"; else echo "::warning::No Apple signing secrets; building ad-hoc signed"; fi
-          cargo xtask build --universal
+        env:
+          SIGN_IDENTITY: ${{ env.APPLE_CERT_ID }}
+        run: cargo xtask build --universal
       - name: Package, sign and notarize
         run: |
           mkdir -p release dmg
-          DMG=$GITHUB_WORKSPACE/release/photosink_macos_universal.dmg
+          DMG="$GITHUB_WORKSPACE/release/photosink_macos_universal.dmg"
+          codesign --verify --deep --strict --verbose=2 apps/macos/build/Photosink.app
           ditto apps/macos/build/Photosink.app dmg/Photosink.app
           ln -s /Applications dmg/Applications
           hdiutil create -volname Photosink -srcfolder dmg -fs HFS+ -format UDZO -ov "$DMG"
-          if [ -n "$APPLE_CERT_B64" ]; then
-            codesign --force --timestamp --sign "$APPLE_CERT_ID" "$DMG"
-            xcrun notarytool submit -k ~/private_keys/"AuthKey_$APPLE_API_KEY.p8" -d "$APPLE_API_KEY" -i "$APPLE_API_ISSUER" --wait --timeout 20m "$DMG"
-            xcrun stapler staple "$DMG"
+          codesign --force --timestamp --sign "$APPLE_CERT_ID" "$DMG"
+          NOTARY_ARGS=(--key "$RUNNER_TEMP/notary-key.p8" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          NOTARY_EXIT=0
+          xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait --timeout 20m --output-format json > "$RUNNER_TEMP/notarization.json" || NOTARY_EXIT=$?
+          cat "$RUNNER_TEMP/notarization.json"
+          if SUBMISSION_ID=$(jq -er '.id // empty' "$RUNNER_TEMP/notarization.json"); then
+            xcrun notarytool log "$SUBMISSION_ID" "${NOTARY_ARGS[@]}"
           fi
+          test "$NOTARY_EXIT" -eq 0
+          jq -e '.status == "Accepted"' "$RUNNER_TEMP/notarization.json" > /dev/null
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+      - name: Clean up signing
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db"
+          fi
+          rm -f "$RUNNER_TEMP/apple_cert.p12" "$RUNNER_TEMP/notary-key.p8"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: photosink_macos_universal
@@ -138,6 +158,8 @@ jobs:
           dotnet tool install --global AzureSignTool
       - name: Build
         shell: pwsh
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: cargo xtask build --target ${{ matrix.target }} --publish
       - name: Sign
         if: env.AZURE_KEY_VAULT_URI != ''
@@ -152,6 +174,24 @@ jobs:
           mkdir -p release
           cp README.md LICENSE apps/windows/bin/publish/${{ matrix.rid }}/
           7z a release/photosink_windows_${{ matrix.arch }}.zip ./apps/windows/bin/publish/${{ matrix.rid }}/*
+      - name: Build installer
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          $signArgs = @()
+          if ($env:AZURE_KEY_VAULT_URI) {
+            $signScript = Join-Path $env:RUNNER_TEMP 'sign-installer.ps1'
+            @'
+          param([string]$File)
+          azuresigntool sign -kvu $env:AZURE_KEY_VAULT_URI -kvi $env:AZURE_CLIENT_ID -kvt $env:AZURE_TENANT_ID -kvs $env:AZURE_CLIENT_SECRET -kvc $env:AZURE_CERT_NAME -tr http://timestamp.digicert.com -v $File
+          exit $LASTEXITCODE
+          '@ | Set-Content $signScript
+            $signArgs = @('/DSign', ('/Sazure=pwsh.exe -NoProfile -File $q{0}$q $f' -f $signScript))
+          }
+          $version = $env:VERSION.TrimStart('v')
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" @signArgs apps/windows/installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: photosink_windows_${{ matrix.arch }}
@@ -180,7 +220,7 @@ jobs:
           rustup update stable
           rustup target add ${{ matrix.target }}
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev dpkg-dev
       - name: Setup cross-compile
         if: matrix.arch == 'aarch64'
         run: |
@@ -200,11 +240,14 @@ jobs:
       - name: Build
         run: cargo xtask build --target ${{ matrix.target }}
       - name: Package
+        env:
+          VERSION: ${{ needs.tag.outputs.version }}
         run: |
           NAME=photosink_linux_${{ matrix.arch }}
           mkdir -p "$NAME" release
           cp apps/linux/target/${{ matrix.target }}/release/photosink apps/linux/photosink.desktop apps/linux/photosink.png README.md LICENSE "$NAME/"
           tar -czf "release/$NAME.tar.gz" "$NAME"
+          bash .github/scripts/package-deb.sh "$VERSION" '${{ matrix.target }}' "release/$NAME.deb"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: photosink_linux_${{ matrix.arch }}
