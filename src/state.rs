@@ -23,8 +23,11 @@ pub(crate) enum Placed {
 
 impl State {
     fn from_conn(conn: Connection) -> Result<State> {
+        conn.create_collation("photosink_path", |a, b| Path::new(a).cmp(Path::new(b)))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS assets (uuid TEXT PRIMARY KEY, dir TEXT NOT NULL, stem TEXT NOT NULL, UNIQUE (dir, stem));
+             CREATE INDEX IF NOT EXISTS assets_path_stem ON assets (dir COLLATE photosink_path, stem);
+             DROP INDEX IF EXISTS assets_stem;
              CREATE TABLE IF NOT EXISTS exports (uuid TEXT NOT NULL, kind TEXT NOT NULL, hash TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (uuid, kind));
              CREATE INDEX IF NOT EXISTS exports_hash ON exports (hash);
              CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -74,7 +77,11 @@ impl State {
     }
 
     pub(crate) fn claim_stem(&self, uuid: &str, dir: &str, stem: &str) -> Result<bool> {
-        Ok(self.conn().execute(
+        let conn = self.conn();
+        if stem_owner(&conn, dir, stem)?.is_some() {
+            return Ok(false);
+        }
+        Ok(conn.execute(
             "INSERT OR IGNORE INTO assets VALUES (?, ?, ?)",
             [uuid, dir, stem],
         )? == 1)
@@ -82,28 +89,20 @@ impl State {
 
     pub(crate) fn assets_under(&self, dir: &str) -> Result<Vec<(String, String, String)>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT uuid, dir, stem FROM assets WHERE dir = ?1 OR dir LIKE ?2 ESCAPE '\\' ORDER BY dir, stem",
-        )?;
-        let like = format!(
-            "{}/%",
-            dir.replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
-        let rows = stmt.query_map([dir, &like], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut stmt = conn.prepare("SELECT uuid, dir, stem FROM assets ORDER BY dir, stem")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut assets = Vec::new();
+        for row in rows {
+            let asset: (String, String, String) = row?;
+            if Path::new(&asset.1).starts_with(dir) {
+                assets.push(asset);
+            }
+        }
+        Ok(assets)
     }
 
     pub(crate) fn stem_owner(&self, dir: &str, stem: &str) -> Result<Option<String>> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT uuid FROM assets WHERE dir = ? AND stem = ?",
-                [dir, stem],
-                |r| r.get(0),
-            )
-            .optional()?)
+        stem_owner(&self.conn(), dir, stem)
     }
 
     pub(crate) fn exports_of(&self, uuid: &str) -> Result<Vec<(Kind, String)>> {
@@ -213,6 +212,16 @@ impl State {
         record(&conn, uuid, kind, hash, path)?;
         Ok(placed)
     }
+}
+
+fn stem_owner(conn: &Connection, dir: &str, stem: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT uuid FROM assets WHERE dir = ? COLLATE photosink_path AND stem = ?",
+            [dir, stem],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 fn exported(conn: &Connection, uuid: &str, kind: Kind) -> Result<Option<String>> {
@@ -327,6 +336,33 @@ mod tests {
     }
 
     #[test]
+    fn finds_assets_by_path_components() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("out_%");
+        let state = State::from_conn(Connection::open_in_memory().unwrap()).unwrap();
+        for (uuid, path) in [
+            ("root", dir.clone()),
+            ("child", dir.join("child")),
+            ("nested", dir.join("child/nested")),
+            ("sibling", root.path().join("out_%-other")),
+        ] {
+            state
+                .claim_stem(uuid, &path.to_string_lossy(), "IMG")
+                .unwrap();
+        }
+        for query in [dir.clone(), dir.join("")] {
+            let mut ids: Vec<_> = state
+                .assets_under(&query.to_string_lossy())
+                .unwrap()
+                .into_iter()
+                .map(|(uuid, _, _)| uuid)
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["child", "nested", "root"]);
+        }
+    }
+
+    #[test]
     fn stems_are_unique_per_dir() {
         let s = State::from_conn(Connection::open_in_memory().unwrap()).unwrap();
         assert_eq!(s.stem("u").unwrap(), None);
@@ -335,5 +371,88 @@ mod tests {
         assert!(s.claim_stem("v", "/e", "IMG_1").unwrap());
         assert_eq!(s.stem("u").unwrap().as_deref(), Some("IMG_1"));
         assert_eq!(s.stem("v").unwrap().as_deref(), Some("IMG_1"));
+    }
+
+    #[test]
+    fn stems_match_equivalent_directories() {
+        let mut dirs = vec!["/e/a", "/e/./a", "/e//a/"];
+        if cfg!(windows) {
+            dirs.extend([r"\e\a", r"\e/a"]);
+        }
+        for stored in &dirs {
+            let s = State::from_conn(Connection::open_in_memory().unwrap()).unwrap();
+            s.conn()
+                .execute(
+                    "INSERT INTO assets VALUES (?, ?, ?)",
+                    ["u", stored, "IMG_1"],
+                )
+                .unwrap();
+            for query in &dirs {
+                assert_eq!(s.stem_owner(query, "IMG_1").unwrap().as_deref(), Some("u"));
+                assert!(!s.claim_stem("v", query, "IMG_1").unwrap());
+            }
+            assert_eq!(
+                s.location("u").unwrap(),
+                Some(((*stored).into(), "IMG_1".into()))
+            );
+            assert!(s.claim_stem("v", "/e/b", "IMG_1").unwrap());
+            assert!(s.claim_stem("w", stored, "IMG_2").unwrap());
+            if !cfg!(windows) {
+                assert!(s.claim_stem("x", r"/e\a", "IMG_1").unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_stems_use_indexed_directory_lookups() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let s = State::from_conn(Connection::open_in_memory().unwrap()).unwrap();
+        let comparisons = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&comparisons);
+        s.conn()
+            .create_collation("photosink_path", move |a, b| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Path::new(a).cmp(Path::new(b))
+            })
+            .unwrap();
+        for i in 0..2_000 {
+            assert!(
+                s.claim_stem(&i.to_string(), &format!("/export/{i}"), "image")
+                    .unwrap()
+            );
+        }
+        comparisons.store(0, Ordering::Relaxed);
+        assert_eq!(
+            s.stem_owner("/export/./1999", "image").unwrap().as_deref(),
+            Some("1999")
+        );
+        assert_eq!(s.stem_owner("/export/missing", "image").unwrap(), None);
+        let count = comparisons.load(Ordering::Relaxed);
+        assert!(count > 0 && count < 100, "{count} path comparisons");
+    }
+
+    #[test]
+    fn indexes_existing_claims_and_reopens() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assets (uuid TEXT PRIMARY KEY, dir TEXT NOT NULL, stem TEXT NOT NULL, UNIQUE (dir, stem));
+             CREATE INDEX assets_stem ON assets (stem);
+             INSERT INTO assets VALUES ('u', '/e/./a', 'IMG_1');",
+        )
+        .unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let s = State::open(&path).unwrap();
+            assert_eq!(s.stem_owner("/e/a", "IMG_1").unwrap().as_deref(), Some("u"));
+            assert!(!s.claim_stem("v", "/e/a", "IMG_1").unwrap());
+            assert_eq!(
+                s.location("u").unwrap(),
+                Some(("/e/./a".into(), "IMG_1".into()))
+            );
+        }
     }
 }

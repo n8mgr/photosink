@@ -1,29 +1,38 @@
 version: 2
+
+multi-ecosystem-groups:
+  dependencies:
+    schedule:
+      interval: weekly
+
 updates:
   - package-ecosystem: cargo
     directories:
       - /
       - /apps/linux
-    schedule:
-      interval: weekly
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
+    allow:
+      - dependency-type: all
     groups:
-      cargo:
+      cargo-security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: [minor, patch]
 
   - package-ecosystem: github-actions
     directory: /
-    schedule:
-      interval: weekly
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
     groups:
-      actions:
+      actions-security:
+        applies-to: security-updates
         patterns: ["*"]
 
   - package-ecosystem: nuget
     directory: /apps/windows
-    schedule:
-      interval: weekly
+    patterns: ["*"]
+    multi-ecosystem-group: dependencies
     groups:
-      nuget:
+      nuget-security:
+        applies-to: security-updates
         patterns: ["*"]
-        update-types: [minor, patch]

@@ -281,8 +281,8 @@ mod tests {
         std::fs::remove_file(old("Nowhere").join("IMG_3.xmp")).unwrap();
 
         let cfg = Config::parse(&format!(
-            "export_dir = \"{}\"\npath = \"{{take.year}}/{{place.city}}\"",
-            out.display()
+            "export_dir = {}\npath = \"{{take.year}}/{{place.city}}\"",
+            toml::Value::String(out.join(".").to_string_lossy().into_owned())
         ))
         .unwrap();
         let r = run(&cfg, &state, &|e| eprintln!("{e}"), false).unwrap();
@@ -298,8 +298,8 @@ mod tests {
             state
                 .exported("v", crate::sources::Kind::Original)
                 .unwrap()
-                .as_deref(),
-            paris.join("IMG_1_v.heic").to_str()
+                .map(PathBuf::from),
+            Some(paris.join("IMG_1_v.heic"))
         );
 
         let r = run(&cfg, &state, &|_| {}, false).unwrap();

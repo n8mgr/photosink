@@ -146,16 +146,16 @@ pub fn run(
         }
     }
 
+    let claims: HashSet<(PathBuf, String)> = state
+        .assets_under(&cfg.export_dir.to_string_lossy())?
+        .into_iter()
+        .filter(|(uuid, _, _)| alive.contains_key(uuid))
+        .map(|(_, dir, stem)| (PathBuf::from(dir), stem))
+        .collect();
     for p in &sidecars {
-        let dir = p
-            .parent()
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let dir = p.parent().unwrap_or(Path::new(""));
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let claimed = match state.stem_owner(&dir, stem)? {
-            Some(uuid) => alive.contains_key(&uuid),
-            None => false,
-        };
+        let claimed = claims.contains(&(dir.to_path_buf(), stem.to_owned()));
         if !claimed && !handled.contains(p) {
             remove(p, dry)?;
             out.removed_sidecars += 1;
@@ -220,7 +220,11 @@ mod tests {
     fn removes_dead_rows_sidecars_and_optionally_orphans() {
         let root = tempfile::tempdir().unwrap();
         let out_dir = root.path().join("out");
-        let cfg = Config::parse(&format!("export_dir = \"{}\"", out_dir.display())).unwrap();
+        let cfg = Config::parse(&format!(
+            "export_dir = {}",
+            toml::Value::String(out_dir.to_string_lossy().into_owned())
+        ))
+        .unwrap();
         let state = State::open(&root.path().join("state.sqlite")).unwrap();
         let a = out_dir.join("2019/05");
         seed(&state, &a, "A", "IMG_1", "IMG_1.HEIC", b"keep");
@@ -277,5 +281,45 @@ mod tests {
         let c = run(&cfg, &state, true, &|e| eprintln!("{e}"), false).unwrap();
         assert_eq!((c.dead_rows, c.orphan_files, c.removed_files), (0, 1, 1));
         assert!(!a.join("stray.PNG").exists());
+    }
+
+    #[test]
+    fn preserves_live_assets_with_equivalent_directory_spellings() {
+        let root = tempfile::tempdir().unwrap();
+        let out_dir = root.path().join("out");
+        let cfg = Config::parse(&format!(
+            "export_dir = {}",
+            toml::Value::String(out_dir.to_string_lossy().into_owned())
+        ))
+        .unwrap();
+        let state = State::open(&root.path().join("state.sqlite")).unwrap();
+        let stored_dir = out_dir.join("2019/./05");
+        let walked_dir = out_dir.join("2019").join("05");
+        assert_ne!(stored_dir.as_os_str(), walked_dir.as_os_str());
+        assert_eq!(stored_dir, walked_dir);
+        seed(&state, &stored_dir, "live", "IMG_1", "IMG_1.HEIC", b"keep");
+        let exported = state.exported("live", Kind::Original).unwrap();
+        let unclaimed = walked_dir.join("lonely.xmp");
+        std::fs::write(&unclaimed, b"<x/>").unwrap();
+
+        for dry in [true, false] {
+            let c = run(&cfg, &state, true, &|e| eprintln!("{e}"), dry).unwrap();
+            assert_eq!(
+                (
+                    c.rows,
+                    c.dead_rows,
+                    c.removed_assets,
+                    c.removed_sidecars,
+                    c.orphan_files,
+                    c.removed_files
+                ),
+                (1, 0, 0, 1, 0, 0)
+            );
+            assert!(walked_dir.join("IMG_1.HEIC").exists());
+            assert!(walked_dir.join("IMG_1.xmp").exists());
+            assert_eq!(state.exported("live", Kind::Original).unwrap(), exported);
+            assert_eq!(state.stem("live").unwrap().as_deref(), Some("IMG_1"));
+            assert_eq!(unclaimed.exists(), dry);
+        }
     }
 }

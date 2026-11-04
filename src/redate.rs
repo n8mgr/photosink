@@ -263,8 +263,8 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let out = root.path().join("out");
             let cfg = Config::parse(&format!(
-                "export_dir = \"{}\"\npath = \"{{take.year}}\"\nembed = false",
-                out.display()
+                "export_dir = {}\npath = \"{{take.year}}\"\nembed = false",
+                toml::Value::String(out.to_string_lossy().into_owned())
             ))
             .unwrap();
             let state = State::open(&root.path().join("state.sqlite")).unwrap();
