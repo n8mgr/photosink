@@ -369,12 +369,19 @@ impl<'a> Exporter<'a> {
             if !r.kind.wanted(self.cfg) {
                 continue;
             }
-            if self.exported(&asset.uuid, r.kind)?
-                && (asset.revision.is_none()
-                    || self.state.revision(&asset.uuid, r.kind)? == asset.revision)
-            {
-                self.summary.skipped += 1;
-                continue;
+            if self.exported(&asset.uuid, r.kind)? {
+                let previous = self.state.revision(&asset.uuid, r.kind)?;
+                if previous.is_none() || asset.revision.is_none() || previous == asset.revision {
+                    if !self.dry
+                        && previous.is_none()
+                        && let Some(revision) = asset.revision.as_deref()
+                    {
+                        self.state
+                            .baseline_revision(&asset.uuid, r.kind, revision)?;
+                    }
+                    self.summary.skipped += 1;
+                    continue;
+                }
             }
             if self.dry {
                 self.plan(asset, r.kind, &r.filename)?;
@@ -636,6 +643,110 @@ mod tests {
             &|_| {},
             dry,
         )
+    }
+
+    #[test]
+    fn baselines_legacy_exports_without_downloading_and_detects_later_changes() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = revision_config(out.path());
+        let database = out.path().join("state.sqlite");
+        let state = State::open(&database).unwrap();
+        let mut src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        Exporter::new(&cfg, &state, &|_| {}, false)
+            .asset(&src, &asset("A", "IMG_1.jpg", ""), "A")
+            .unwrap();
+        let original = state.exported("A", Kind::Original).unwrap().unwrap();
+        assert_eq!(state.revision("A", Kind::Original).unwrap(), None);
+        drop(state);
+        let state = State::open(&database).unwrap();
+
+        src.fail = true;
+        let dry = run_revision(&src, &cfg, &state, "1", true);
+        assert_eq!((dry.skipped, dry.exported, dry.errors), (1, 0, 0));
+        assert_eq!(state.revision("A", Kind::Original).unwrap(), None);
+        for _ in 0..2 {
+            let result = run_revision(&src, &cfg, &state, "1", false);
+            assert_eq!(
+                (
+                    result.skipped,
+                    result.exported,
+                    result.duplicates,
+                    result.errors
+                ),
+                (1, 0, 0, 0)
+            );
+        }
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.revision("A", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(original.as_str())
+        );
+
+        src.fail = false;
+        src.bytes = b"two";
+        let changed = run_revision(&src, &cfg, &state, "2", false);
+        assert_eq!(
+            (changed.exported, changed.duplicates, changed.errors),
+            (1, 0, 0)
+        );
+        assert_eq!(src.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(std::fs::read(&original).unwrap(), b"one");
+        let current = state.exported("A", Kind::Original).unwrap().unwrap();
+        assert_ne!(current, original);
+        assert_eq!(std::fs::read(current).unwrap(), b"two");
+    }
+
+    #[test]
+    fn legacy_baselines_do_not_skip_missing_or_unexported_resources() {
+        for missing in [false, true] {
+            let out = tempfile::tempdir().unwrap();
+            let cfg = revision_config(out.path());
+            let state = State::open(&out.path().join("state.sqlite")).unwrap();
+            let src = Fake(HashMap::from([(
+                "A",
+                vec![(Kind::Original, "IMG_1.jpg", b"one".as_slice())],
+            )]));
+            let mut a = asset("A", "IMG_1.jpg", "");
+            Exporter::new(&cfg, &state, &|_| {}, false)
+                .asset(&src, &a, "A")
+                .unwrap();
+            let original = state.exported("A", Kind::Original).unwrap().unwrap();
+            if missing {
+                std::fs::remove_file(&original).unwrap();
+            }
+            a.revision = Some("1".into());
+            let src = Fake(HashMap::from([(
+                "A",
+                vec![
+                    (Kind::Original, "IMG_1.jpg", b"one".as_slice()),
+                    (Kind::PairedVideo, "IMG_1.mov", b"video".as_slice()),
+                ],
+            )]));
+            let mut exporter = Exporter::new(&cfg, &state, &|_| {}, false);
+            exporter.asset(&src, &a, "A").unwrap();
+            let result = exporter.finish();
+            assert_eq!(
+                (
+                    result.exported,
+                    result.skipped,
+                    result.duplicates,
+                    result.errors
+                ),
+                if missing { (2, 0, 0, 0) } else { (1, 1, 0, 0) }
+            );
+            for kind in [Kind::Original, Kind::PairedVideo] {
+                assert_eq!(state.revision("A", kind).unwrap().as_deref(), Some("1"));
+                assert!(Path::new(&state.exported("A", kind).unwrap().unwrap()).is_file());
+            }
+        }
     }
 
     #[test]

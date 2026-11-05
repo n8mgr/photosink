@@ -9,7 +9,6 @@ export_dir = "~/Pictures/Export"
 # sidecar = true
 # onedrive_client_id = "cf81c004-3e08-4c30-804c-92271c32669d"
 # dropbox_app_key = "your app key"   # needed for Dropbox; see the README
-# automatic = false
 # check_interval_minutes = 15
 # keep_running_after_close = false
 

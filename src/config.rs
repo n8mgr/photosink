@@ -32,8 +32,8 @@ pub struct Config {
     pub onedrive_client_id: String,
     #[serde(default)]
     pub dropbox_app_key: String,
-    #[serde(default)]
-    pub automatic: bool,
+    #[serde(default, rename = "automatic")]
+    _legacy_automatic: bool,
     #[serde(default = "default_check_interval")]
     pub check_interval_minutes: u32,
     #[serde(default)]
@@ -154,6 +154,7 @@ pub fn update(path: &Path, set: impl FnOnce(&mut toml::Table)) -> Result<()> {
     }
     let mut table: toml::Table = std::fs::read_to_string(path)?.parse()?;
     set(&mut table);
+    table.remove("automatic");
     let text = toml::to_string(&table)?;
     Config::parse(&text)?;
     let parent = path
@@ -211,7 +212,6 @@ mod tests {
         assert_eq!(cfg.filename, "{stem}");
         assert_eq!(cfg.concurrency, 4);
         assert!(!cfg.edits);
-        assert!(!cfg.automatic);
         assert!(!cfg.keep_running_after_close);
         assert_eq!(cfg.check_interval_minutes, 15);
         assert!(cfg.sources.is_empty());

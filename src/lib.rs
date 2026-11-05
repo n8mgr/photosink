@@ -414,7 +414,7 @@ impl App {
             progress,
             auth,
         )?;
-        let key = format!("dropbox_cursor:{folder}");
+        let key = format!("dropbox_cursor:v2:{folder}");
         self.export_changes(&src, &key, |c| src.list(folder, c), progress, dry)
     }
 

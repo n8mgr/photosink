@@ -1,4 +1,5 @@
 import AppKit
+import CoreServices
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -304,6 +305,26 @@ struct MainView: View {
 final class Delegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     var openMainWindow: (() -> Void)?
+    private var quittingCompletely = false
+
+    func quitCompletely() {
+        quittingCompletely = true
+        NSApp.terminate(nil)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let reason = NSAppleEventManager.shared().currentAppleEvent?
+            .paramDescriptor(forKeyword: AEKeyword(kAEQuitReason))?.enumCodeValue
+        let systemQuit = [kAEQuitAll, kAEShutDown, kAERestart, kAEReallyLogOut]
+            .contains { reason == OSType($0) }
+        guard !quittingCompletely, !systemQuit, model?.settings?.keepRunningAfterClose == true else {
+            return .terminateNow
+        }
+        for window in sender.windows where window.styleMask.contains(.titled) {
+            window.close()
+        }
+        return .terminateCancel
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         model?.settings?.keepRunningAfterClose != true
@@ -321,6 +342,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
 struct BackgroundMenu: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
+    let delegate: Delegate
 
     var body: some View {
         Button("Open Photosink") {
@@ -332,8 +354,8 @@ struct BackgroundMenu: View {
             NSApp.activate()
         }
         Divider()
-        Button("Quit Photosink") { NSApp.terminate(nil) }
-            .keyboardShortcut("q")
+        Button("Quit Photosink Completely") { delegate.quitCompletely() }
+            .keyboardShortcut("q", modifiers: [.command, .option])
     }
 }
 
@@ -352,7 +374,7 @@ struct PhotosinkApp: App {
             SettingsWindow().environment(model)
         }
         MenuBarExtra("Photosink", systemImage: "photo.on.rectangle.angled") {
-            BackgroundMenu()
+            BackgroundMenu(delegate: delegate)
         }
     }
 }

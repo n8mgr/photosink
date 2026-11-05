@@ -841,9 +841,7 @@ mod tests {
         )
         .unwrap();
         assert!(!core.run_args(Tab::Clean).automatic);
-        let mut settings = core.settings().unwrap();
-        settings.automatic = true;
-        core.save_settings(settings).unwrap();
+        assert!(core.automatic_enabled());
         let reopened = isolated_core(&path);
         let args = reopened.run_args(Tab::OneDrive);
         assert_eq!(args.arg, "Pictures/Trips");
@@ -859,7 +857,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "export_dir = '/out'\nautomatic = true\n[sources.onedrive]\nautomatic = true\n",
+            "export_dir = '/out'\n[sources.onedrive]\nautomatic = true\n",
         )
         .unwrap();
         let core = isolated_core(&path);
@@ -897,7 +895,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "export_dir = '/out'\nautomatic = true\n[sources.onedrive]\nautomatic = true\n",
+            "export_dir = '/out'\n[sources.onedrive]\nautomatic = true\n",
         )
         .unwrap();
         let core = isolated_core(&path);
@@ -918,26 +916,41 @@ mod tests {
     }
 
     #[test]
-    fn disabling_automatic_checks_preserves_sources_and_cancels_pending_runs() {
+    fn source_toggles_control_automatic_checks_independently() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "export_dir = '/out'\nautomatic = true\n[sources.onedrive]\nautomatic = true\n",
+            "export_dir = '/out'\nautomatic = false\n[sources.onedrive]\narg = 'Pictures'\nautomatic = true\n[sources.dropbox]\nautomatic = true\n",
         )
         .unwrap();
         let core = isolated_core(&path);
-        let mut settings = core.settings().unwrap();
+        core.settings().unwrap();
         assert!(core.automatic_enabled());
-        settings.automatic = false;
-        core.save_settings(settings).unwrap();
+        let mut args = core.run_args(Tab::OneDrive);
+        args.automatic = false;
+        core.set_run_args(Tab::OneDrive, args).unwrap();
+        assert!(core.automatic_enabled());
+        assert_eq!(
+            core.model().schedule.ready(Instant::now()),
+            Some(Tab::Dropbox)
+        );
+        assert_eq!(core.run_args(Tab::OneDrive).arg, "Pictures");
+        let mut args = core.run_args(Tab::Dropbox);
+        args.automatic = false;
+        core.set_run_args(Tab::Dropbox, args).unwrap();
         assert!(!core.automatic_enabled());
-        assert!(core.run_args(Tab::OneDrive).automatic);
         assert!(
             core.shared
                 .scheduled_run(Instant::now() + Duration::from_secs(3600))
                 .is_none()
         );
+        let saved: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(!saved.contains_key("automatic"));
+        let reopened = isolated_core(&path);
+        assert!(!reopened.run_args(Tab::OneDrive).automatic);
+        assert!(!reopened.run_args(Tab::Dropbox).automatic);
+        assert!(!reopened.automatic_enabled());
     }
 
     #[test]
@@ -946,7 +959,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "export_dir = '/out'\nautomatic = true\n[sources.onedrive]\nautomatic = true\n",
+            "export_dir = '/out'\n[sources.onedrive]\nautomatic = true\n",
         )
         .unwrap();
         let core = isolated_core(&path);

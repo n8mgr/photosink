@@ -187,6 +187,17 @@ impl State {
         self.get(&format!("revision:{uuid}:{}", kind.name()))
     }
 
+    pub(crate) fn baseline_revision(&self, uuid: &str, kind: Kind, revision: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO kv VALUES (?, ?)",
+            [
+                format!("revision:{uuid}:{}", kind.name()),
+                revision.to_owned(),
+            ],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn record(&self, uuid: &str, kind: Kind, hash: &str, path: &str) -> Result<()> {
         record(&self.conn(), uuid, kind, hash, path)

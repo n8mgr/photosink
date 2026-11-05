@@ -22,13 +22,10 @@ impl Schedule {
         } else {
             now
         };
-        if !settings.automatic || self.interval != interval {
+        if self.interval != interval {
             self.due.clear();
         }
         self.interval = interval;
-        if !settings.automatic {
-            return;
-        }
         self.due
             .retain(|tab, _| args.get(tab).is_some_and(|a| a.automatic));
         for tab in catalog::tabs().into_iter().filter(|t| t.is_source()) {
@@ -66,17 +63,16 @@ mod tests {
     #[test]
     fn requires_opt_in_and_never_schedules_maintenance() {
         let now = Instant::now();
-        let mut settings = Settings::from_config(&Config::parse("export_dir = '/out'").unwrap());
+        let settings = Settings::from_config(&Config::parse("export_dir = '/out'").unwrap());
         let mut args: HashMap<_, _> = catalog::tabs()
             .into_iter()
             .map(|tab| (tab, tab.default_args()))
             .collect();
         let mut schedule = Schedule::default();
-        args.get_mut(&Tab::OneDrive).unwrap().automatic = true;
         args.get_mut(&Tab::Clean).unwrap().automatic = true;
         schedule.configure(&settings, &args, now);
         assert_eq!(schedule.ready(now), None);
-        settings.automatic = true;
+        args.get_mut(&Tab::OneDrive).unwrap().automatic = true;
         schedule.configure(&settings, &args, now);
         assert_eq!(schedule.ready(now), Some(Tab::OneDrive));
         schedule.finished(Tab::OneDrive, now);
@@ -90,7 +86,6 @@ mod tests {
     fn waits_after_completion_and_does_not_catch_up_missed_intervals() {
         let now = Instant::now();
         let mut settings = Settings::from_config(&Config::parse("export_dir = '/out'").unwrap());
-        settings.automatic = true;
         settings.check_interval_minutes = 15;
         let args = [Tab::OneDrive, Tab::Dropbox]
             .into_iter()
@@ -118,11 +113,15 @@ mod tests {
             schedule.ready(after_long_run + Duration::from_secs(900)),
             Some(Tab::OneDrive)
         );
-        settings.automatic = false;
+        settings.check_interval_minutes = 30;
         schedule.configure(&settings, &args, after_long_run);
         assert_eq!(
-            schedule.ready(after_long_run + Duration::from_secs(7200)),
+            schedule.ready(after_long_run + Duration::from_secs(1799)),
             None
+        );
+        assert_eq!(
+            schedule.ready(after_long_run + Duration::from_secs(1800)),
+            Some(Tab::OneDrive)
         );
     }
 }

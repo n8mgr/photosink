@@ -59,7 +59,6 @@ pub struct SettingsPanel {
     filter_group: adw::PreferencesGroup,
     edits: Vec<(bool, gtk::ToggleButton)>,
     metadata: Vec<(Metadata, gtk::ToggleButton)>,
-    automatic: adw::SwitchRow,
     interval: adw::SpinRow,
     keep_running: adw::SwitchRow,
     open_at_login: adw::SwitchRow,
@@ -465,7 +464,6 @@ impl SettingsPanel {
         for (v, b) in &self.metadata {
             b.set_active(*v == s.metadata);
         }
-        self.automatic.set_active(s.automatic);
         self.interval.set_value(f64::from(s.check_interval_minutes));
         self.keep_running.set_active(s.keep_running_after_close);
         match crate::startup::enabled() {
@@ -523,12 +521,6 @@ impl SettingsPanel {
     }
 
     fn connect(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.automatic.connect_active_notify(move |row| {
-            if let Some(panel) = weak.upgrade() {
-                panel.edit(|s| s.automatic = row.is_active());
-            }
-        });
         let weak = Rc::downgrade(self);
         self.interval.connect_value_notify(move |row| {
             if let Some(panel) = weak.upgrade() {
@@ -763,12 +755,9 @@ impl SettingsPanel {
         ]));
 
         let automation = page("Automation", "alarm-symbolic");
-        let automatic = adw::SwitchRow::builder()
-            .title("Enable automatic exports")
-            .subtitle("Select Export automatically on each source to include it. Uses your saved export settings; dry run does not apply.")
-            .build();
         let interval = adw::SpinRow::builder()
             .title("Check every (minutes)")
+            .subtitle("Applies to sources with Export automatically enabled. Uses your saved export settings; dry run does not apply.")
             .adjustment(&gtk::Adjustment::new(15.0, 1.0, 1440.0, 1.0, 15.0, 0.0))
             .numeric(true)
             .build();
@@ -778,7 +767,6 @@ impl SettingsPanel {
             .build();
         let open_at_login = adw::SwitchRow::builder().title("Open at login").build();
         automation.add(&group_of(&[
-            automatic.upcast_ref(),
             interval.upcast_ref(),
             keep_running.upcast_ref(),
             open_at_login.upcast_ref(),
@@ -818,7 +806,6 @@ impl SettingsPanel {
             filter_group,
             edits,
             metadata,
-            automatic,
             interval,
             keep_running,
             open_at_login,

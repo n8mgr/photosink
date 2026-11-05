@@ -41,7 +41,6 @@ pub enum TemplateKind {
 /// albums and keywords are comma separated.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Settings {
-    pub automatic: bool,
     pub check_interval_minutes: u32,
     pub keep_running_after_close: bool,
     pub export_dir: String,
@@ -183,7 +182,6 @@ impl Settings {
     pub(crate) fn from_config(cfg: &Config) -> Settings {
         let (zone, offset) = zone_mode(cfg.date_zone);
         Settings {
-            automatic: cfg.automatic,
             check_interval_minutes: cfg.check_interval_minutes,
             keep_running_after_close: cfg.keep_running_after_close,
             export_dir: cfg.export_dir.display().to_string(),
@@ -280,7 +278,6 @@ impl Settings {
         let filter = toml::Value::try_from(filter).map_err(anyhow::Error::from)?;
         let zone = self.zone_value();
         config::update(path, |t| {
-            t.insert("automatic".into(), self.automatic.into());
             t.insert(
                 "check_interval_minutes".into(),
                 self.check_interval_minutes.into(),
@@ -359,7 +356,6 @@ mod tests {
         s.metadata = Metadata::Embed;
         s.albums = " Trip, , Beach ".into();
         s.from = "2019-01-01".into();
-        s.automatic = true;
         s.check_interval_minutes = 30;
         s.keep_running_after_close = true;
         s.save(&path).unwrap();
@@ -371,7 +367,7 @@ mod tests {
         assert_eq!(back.zone, ZoneMode::Fixed);
         assert_eq!(back.offset, "+02:00");
         assert_eq!(back.albums, "Trip, Beach");
-        assert!(back.automatic && back.keep_running_after_close);
+        assert!(back.keep_running_after_close);
         assert_eq!(back.check_interval_minutes, 30);
         s.from = "2019-13-01".into();
         assert!(s.save(&path).is_err());

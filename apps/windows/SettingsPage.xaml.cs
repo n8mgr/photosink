@@ -180,7 +180,6 @@ public sealed partial class SettingsPage : UserControl
         KeywordsBox.Text = s.Keywords;
         EditsBox.SelectedIndex = s.Edits ? 1 : 0;
         MetadataBox.SelectedIndex = Array.IndexOf(Copy.MetadataChoices, s.Metadata);
-        AutomaticSwitch.IsOn = s.Automatic;
         IntervalBox.Value = s.CheckIntervalMinutes;
         KeepRunningSwitch.IsOn = s.KeepRunningAfterClose;
         loading = false;
@@ -275,7 +274,6 @@ public sealed partial class SettingsPage : UserControl
 
     private void Wire()
     {
-        AutomaticSwitch.Toggled += (_, _) => Edit(s => s with { Automatic = AutomaticSwitch.IsOn });
         KeepRunningSwitch.Toggled += (_, _) => Edit(s => s with { KeepRunningAfterClose = KeepRunningSwitch.IsOn });
         IntervalBox.ValueChanged += (_, _) =>
         {

@@ -340,14 +340,12 @@ struct SettingsWindow: View {
     @ViewBuilder
     private func automation(_ s: Settings) -> some View {
         SwiftUI.Section {
-            Toggle("Export automatically", isOn: Binding(get: { s.automatic }, set: { v in set(s) { $0.automatic = v } }))
             Stepper("Check every \(s.checkIntervalMinutes.formatted()) \(s.checkIntervalMinutes == 1 ? "minute" : "minutes")", value: Binding(
                 get: { Int(s.checkIntervalMinutes) },
                 set: { v in set(s) { $0.checkIntervalMinutes = UInt32(v) } }
             ), in: 1...1440)
-            .disabled(!s.automatic)
         } footer: {
-            Text("Select Export automatically on each source to include it. Automatic checks export files using your saved settings and filters.")
+            Text("Enable Export automatically on a source to check it at this interval. Automatic checks export files using your saved settings and filters.")
         }
         SwiftUI.Section {
             Toggle("Keep running after closing the window", isOn: Binding(
@@ -356,7 +354,7 @@ struct SettingsWindow: View {
             ))
             LoginItemToggle()
         } footer: {
-            Text("When kept running, Photosink stays in the menu bar after its window closes. Choose Quit Photosink to stop it.")
+            Text("When kept running, closing the window or choosing Quit Photosink leaves the app in the menu bar. Choose Quit Photosink Completely from the menu bar to stop it.")
         }
     }
 }
