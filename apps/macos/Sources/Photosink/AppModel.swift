@@ -147,7 +147,7 @@ final class AppModel {
     }
 
     func select(_ t: Tab) {
-        guard !running || t == tab else { return }
+        guard !running || t == runningTab else { return }
         tab = t
         args = core.runArgs(tab: t)
         if let g = SidebarGroup.allCases.first(where: { $0.contains(t) }) { lastInGroup[g] = t }
@@ -159,14 +159,18 @@ final class AppModel {
     }
 
     func setArgs(_ a: RunArgs) {
-        args = a
-        core.setRunArgs(tab: tab, args: a)
+        do {
+            try core.setRunArgs(tab: tab, args: a)
+            args = a
+        } catch {
+            notice = message(error, tab: tab)
+        }
     }
 
     func save(_ s: Settings) {
-        settings = s
         do {
             try core.saveSettings(settings: s)
+            settings = s
             settingsError = nil
         } catch {
             settingsError = message(error, tab: tab)

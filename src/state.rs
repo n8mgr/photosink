@@ -30,6 +30,8 @@ impl State {
              DROP INDEX IF EXISTS assets_stem;
              CREATE TABLE IF NOT EXISTS exports (uuid TEXT NOT NULL, kind TEXT NOT NULL, hash TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (uuid, kind));
              CREATE INDEX IF NOT EXISTS exports_hash ON exports (hash);
+             CREATE TABLE IF NOT EXISTS export_history (uuid TEXT NOT NULL, kind TEXT NOT NULL, hash TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (uuid, kind, path));
+             CREATE INDEX IF NOT EXISTS export_history_hash ON export_history (hash);
              CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
         Ok(State {
@@ -112,12 +114,22 @@ impl State {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub(crate) fn paths_of(&self, uuid: &str) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM exports WHERE uuid = ?1
+             UNION SELECT path FROM export_history WHERE uuid = ?1",
+        )?;
+        let rows = stmt.query_map([uuid], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub(crate) fn relocate(
         &self,
         uuid: &str,
         dir: &str,
         stem: &str,
-        paths: &[(Kind, String)],
+        paths: &[(String, String)],
     ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -125,16 +137,13 @@ impl State {
             "UPDATE assets SET dir = ?, stem = ? WHERE uuid = ?",
             [dir, stem, uuid],
         )?;
-        for (kind, path) in paths {
-            let old = exported(&tx, uuid, *kind)?;
-            tx.execute(
-                "UPDATE exports SET path = ? WHERE uuid = ? AND kind = ?",
-                params![path, uuid, kind],
-            )?;
+        for (old, path) in paths {
             // Content duplicates of this asset point at the same file.
-            if let Some(old) = old {
-                tx.execute("UPDATE exports SET path = ? WHERE path = ?", [path, &old])?;
-            }
+            tx.execute("UPDATE exports SET path = ? WHERE path = ?", [path, old])?;
+            tx.execute(
+                "UPDATE export_history SET path = ? WHERE path = ?",
+                [path, old],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -142,7 +151,10 @@ impl State {
 
     pub(crate) fn shared(&self, path: &str) -> Result<bool> {
         let n: i64 = self.conn().query_row(
-            "SELECT COUNT(DISTINCT uuid) FROM exports WHERE path = ?",
+            "SELECT COUNT(DISTINCT uuid) FROM (
+                SELECT uuid FROM exports WHERE path = ?1
+                UNION SELECT uuid FROM export_history WHERE path = ?1
+             )",
             [path],
             |r| r.get(0),
         )?;
@@ -151,7 +163,10 @@ impl State {
 
     pub(crate) fn all_exports(&self) -> Result<Vec<Export>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT uuid, kind, path FROM exports ORDER BY rowid")?;
+        let mut stmt = conn.prepare(
+            "SELECT uuid, kind, path FROM exports
+             UNION SELECT uuid, kind, path FROM export_history",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(Export {
                 uuid: r.get(0)?,
@@ -162,11 +177,18 @@ impl State {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub(crate) fn forget_export(&self, uuid: &str, kind: Kind) -> Result<()> {
-        self.conn().execute(
-            "DELETE FROM exports WHERE uuid = ? AND kind = ?",
-            params![uuid, kind],
+    pub(crate) fn forget_export(&self, uuid: &str, kind: Kind, path: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM exports WHERE uuid = ? AND kind = ? AND path = ?",
+            params![uuid, kind, path],
         )?;
+        tx.execute(
+            "DELETE FROM export_history WHERE uuid = ? AND kind = ? AND path = ?",
+            params![uuid, kind, path],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -175,6 +197,7 @@ impl State {
     pub(crate) fn forget_asset(&self, uuid: &str) -> Result<()> {
         let conn = self.conn();
         conn.execute("DELETE FROM exports WHERE uuid = ?", [uuid])?;
+        conn.execute("DELETE FROM export_history WHERE uuid = ?", [uuid])?;
         conn.execute("DELETE FROM assets WHERE uuid = ?", [uuid])?;
         Ok(())
     }
@@ -183,34 +206,66 @@ impl State {
         exported(&self.conn(), uuid, kind)
     }
 
+    pub(crate) fn revision(&self, uuid: &str, kind: Kind) -> Result<Option<String>> {
+        self.get(&format!("revision:{uuid}:{}", kind.name()))
+    }
+
+    pub(crate) fn baseline_revision(&self, uuid: &str, kind: Kind, revision: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO kv VALUES (?, ?)",
+            [
+                format!("revision:{uuid}:{}", kind.name()),
+                revision.to_owned(),
+            ],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn record(&self, uuid: &str, kind: Kind, hash: &str, path: &str) -> Result<()> {
         record(&self.conn(), uuid, kind, hash, path)
     }
 
+    #[cfg(test)]
     pub(crate) fn duplicate(&self, hash: &str) -> Result<Option<String>> {
         duplicate(&self.conn(), hash)
     }
 
+    /// Returns None when neither a duplicate nor a destination is available.
     pub(crate) fn place(
         &self,
         uuid: &str,
         kind: Kind,
         hash: &str,
         tmp: &Path,
-        dest: impl FnOnce() -> Result<Placed>,
-    ) -> Result<Placed> {
-        let conn = self.conn();
-        let placed = match duplicate(&conn, hash)? {
+        revision: Option<&str>,
+        dest: impl FnOnce() -> Result<Option<Placed>>,
+    ) -> Result<Option<Placed>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let placed = match duplicate(&tx, hash)? {
             Some(path) => {
                 std::fs::remove_file(tmp)?;
                 Placed::Duplicate(path)
             }
-            None => dest()?,
+            None => match dest()? {
+                Some(placed) => placed,
+                None => return Ok(None),
+            },
         };
         let (Placed::New(path) | Placed::Duplicate(path)) = &placed;
-        record(&conn, uuid, kind, hash, path)?;
-        Ok(placed)
+        record(&tx, uuid, kind, hash, path)?;
+        let key = format!("revision:{uuid}:{}", kind.name());
+        if let Some(revision) = revision {
+            tx.execute(
+                "INSERT OR REPLACE INTO kv VALUES (?, ?)",
+                [key, revision.to_owned()],
+            )?;
+        } else {
+            tx.execute("DELETE FROM kv WHERE key = ?", [key])?;
+        }
+        tx.commit()?;
+        Ok(Some(placed))
     }
 }
 
@@ -236,6 +291,15 @@ fn exported(conn: &Connection, uuid: &str, kind: Kind) -> Result<Option<String>>
 
 fn record(conn: &Connection, uuid: &str, kind: Kind, hash: &str, path: &str) -> Result<()> {
     conn.execute(
+        "INSERT OR IGNORE INTO export_history
+         SELECT uuid, kind, hash, path FROM exports WHERE uuid = ? AND kind = ? AND path != ?",
+        params![uuid, kind, path],
+    )?;
+    conn.execute(
+        "DELETE FROM export_history WHERE uuid = ? AND kind = ? AND path = ?",
+        params![uuid, kind, path],
+    )?;
+    conn.execute(
         "INSERT OR REPLACE INTO exports VALUES (?, ?, ?, ?)",
         params![uuid, kind, hash, path],
     )?;
@@ -243,13 +307,17 @@ fn record(conn: &Connection, uuid: &str, kind: Kind, hash: &str, path: &str) -> 
 }
 
 fn duplicate(conn: &Connection, hash: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT path FROM exports WHERE hash = ? LIMIT 1",
-            [hash],
-            |r| r.get(0),
-        )
-        .optional()?)
+    let mut stmt = conn.prepare(
+        "SELECT path FROM exports WHERE hash = ?1
+         UNION ALL SELECT path FROM export_history WHERE hash = ?1",
+    )?;
+    for path in stmt.query_map([hash], |r| r.get::<_, String>(0))? {
+        let path = path?;
+        if Path::new(&path).is_file() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -273,15 +341,15 @@ mod tests {
         let dest = dir.path().join("IMG_1.HEIC");
         let mv = |to: &Path| {
             std::fs::rename(&tmp, to)?;
-            Ok(Placed::New(to.to_string_lossy().into_owned()))
+            Ok(Some(Placed::New(to.to_string_lossy().into_owned())))
         };
         assert_eq!(s.exported("u", Kind::Original).unwrap(), None);
         assert_eq!(s.duplicate("h").unwrap(), None);
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("u", Kind::Original, "h", &tmp, || mv(&dest))
+            s.place("u", Kind::Original, "h", &tmp, None, || mv(&dest))
                 .unwrap(),
-            Placed::New(dest.to_string_lossy().into_owned())
+            Some(Placed::New(dest.to_string_lossy().into_owned()))
         );
         assert!(dest.exists() && !tmp.exists());
         assert_eq!(
@@ -292,12 +360,113 @@ mod tests {
         assert_eq!(s.duplicate("h").unwrap().as_deref(), dest.to_str());
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("v", Kind::Original, "h", &tmp, || unreachable!())
+            s.place("v", Kind::Original, "h", &tmp, None, || unreachable!())
                 .unwrap(),
-            Placed::Duplicate(dest.to_string_lossy().into_owned())
+            Some(Placed::Duplicate(dest.to_string_lossy().into_owned()))
         );
         assert!(!tmp.exists());
         assert!(s.exported("v", Kind::Original).unwrap().is_some());
+    }
+
+    #[test]
+    fn revisions_follow_successfully_placed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::from_conn(Connection::open_in_memory().unwrap()).unwrap();
+        let tmp = dir.path().join("part");
+        let old = dir.path().join("old.jpg");
+        let new = dir.path().join("new.jpg");
+        std::fs::write(&tmp, b"old").unwrap();
+        state
+            .place("u", Kind::Original, "old", &tmp, Some("1"), || {
+                std::fs::rename(&tmp, &old)?;
+                Ok(Some(Placed::New(old.to_string_lossy().into_owned())))
+            })
+            .unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+        assert!(
+            state
+                .place("u", Kind::Original, "new", &tmp, Some("2"), || {
+                    anyhow::bail!("placement failed")
+                })
+                .is_err()
+        );
+        assert_eq!(
+            state.revision("u", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            state.exported("u", Kind::Original).unwrap().as_deref(),
+            old.to_str()
+        );
+        state
+            .place("u", Kind::Original, "new", &tmp, None, || {
+                std::fs::rename(&tmp, &new)?;
+                Ok(Some(Placed::New(new.to_string_lossy().into_owned())))
+            })
+            .unwrap();
+        assert_eq!(state.revision("u", Kind::Original).unwrap(), None);
+        assert_eq!(
+            state.exported("u", Kind::Original).unwrap().as_deref(),
+            new.to_str()
+        );
+        assert_eq!(std::fs::read(old).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rechecks_duplicates_after_preparing_a_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("state.sqlite")).unwrap();
+        let tmp = dir.path().join("part");
+        std::fs::write(&tmp, b"old").unwrap();
+        assert_eq!(
+            state
+                .place("u", Kind::Original, "old", &tmp, Some("1"), || Ok(None))
+                .unwrap(),
+            None
+        );
+        assert!(tmp.exists());
+        assert_eq!(state.revision("u", Kind::Original).unwrap(), None);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let old = dir.path().join("old.jpg");
+                    let new = dir.path().join("new.jpg");
+                    std::fs::write(&old, b"old").unwrap();
+                    std::fs::write(&new, b"new").unwrap();
+                    state
+                        .record("v", Kind::Original, "old", old.to_str().unwrap())
+                        .unwrap();
+                    state
+                        .record("v", Kind::Original, "new", new.to_str().unwrap())
+                        .unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+        let old = dir.path().join("old.jpg").to_string_lossy().into_owned();
+        assert_eq!(
+            state
+                .place(
+                    "u",
+                    Kind::Original,
+                    "old",
+                    &tmp,
+                    Some("1"),
+                    || unreachable!()
+                )
+                .unwrap(),
+            Some(Placed::Duplicate(old.clone()))
+        );
+        assert!(!tmp.exists());
+        assert_eq!(
+            state.exported("u", Kind::Original).unwrap(),
+            Some(old.clone())
+        );
+        assert_eq!(
+            state.revision("u", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert!(state.shared(&old).unwrap());
     }
 
     #[test]
@@ -319,7 +488,7 @@ mod tests {
             "u",
             "/e/b",
             "IMG_1_x",
-            &[(Kind::Original, "/e/b/IMG_1_x.jpg".into())],
+            &[("/e/a/IMG_1.jpg".into(), "/e/b/IMG_1_x.jpg".into())],
         )
         .unwrap();
         assert_eq!(s.stem("u").unwrap().as_deref(), Some("IMG_1_x"));

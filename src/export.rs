@@ -51,24 +51,53 @@ pub(crate) fn write_hashed(mut src: impl Read, dest: &Path) -> Result<String> {
     }
 }
 
-fn link_unique(tmp: &Path, dest: &Path, uuid: &str, hash: &str) -> Result<Placed> {
-    let fallback = {
-        let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let ext = dest
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        dest.with_file_name(format!("{stem}_{}{ext}", &uuid[..uuid.len().min(8)]))
-    };
-    for candidate in [dest.to_path_buf(), fallback] {
-        match std::fs::hard_link(tmp, &candidate) {
+fn copy_new(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(src)?;
+    let mut file = std::fs::File::create_new(dest)?;
+    let result = std::io::copy(&mut src, &mut file).map(|_| ());
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+fn link_unique(
+    tmp: &Path,
+    dest: &Path,
+    uuid: &str,
+    hash: &str,
+    preserve_existing: bool,
+) -> Result<Placed> {
+    let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let id = &uuid[..uuid.len().min(8)];
+    let version = &hash[..hash.len().min(12)];
+    for n in 0_u64.. {
+        let candidate = match n {
+            0 => dest.to_path_buf(),
+            1 => dest.with_file_name(format!("{stem}_{id}{ext}")),
+            2 => dest.with_file_name(format!("{stem}_{id}_{version}{ext}")),
+            _ => dest.with_file_name(format!("{stem}_{id}_{version}_{n}{ext}")),
+        };
+        let placed = std::fs::hard_link(tmp, &candidate).or_else(|e| {
+            if e.kind() == ErrorKind::CrossesDevices {
+                copy_new(tmp, &candidate)
+            } else {
+                Err(e)
+            }
+        });
+        match placed {
             Ok(()) => {
                 std::fs::remove_file(tmp)?;
                 return Ok(Placed::New(candidate.to_string_lossy().into_owned()));
             }
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                if hash_file(&candidate)? == hash {
+                if !preserve_existing && candidate.is_file() && hash_file(&candidate)? == hash {
                     std::fs::remove_file(tmp)?;
                     return Ok(Placed::Duplicate(candidate.to_string_lossy().into_owned()));
                 }
@@ -76,7 +105,7 @@ fn link_unique(tmp: &Path, dest: &Path, uuid: &str, hash: &str) -> Result<Placed
             Err(e) => return Err(e.into()),
         }
     }
-    anyhow::bail!("{} exists", dest.display())
+    unreachable!()
 }
 
 /// The stem the filename template produces for the asset, falling back to the
@@ -124,6 +153,7 @@ pub(crate) struct Exporter<'a> {
     state: &'a State,
     progress: Progress<'a>,
     location: Option<(String, PathBuf, String)>,
+    temp_dir: Option<tempfile::TempDir>,
     pos: (usize, usize),
     dry: bool,
     pub(crate) summary: Summary,
@@ -143,6 +173,7 @@ impl<'a> Exporter<'a> {
             state,
             progress,
             location: None,
+            temp_dir: None,
             pos: (0, 0),
             dry,
             summary: Summary::default(),
@@ -169,6 +200,9 @@ impl<'a> Exporter<'a> {
         if let Some((uuid, dir, stem)) = &self.location
             && uuid == &asset.uuid
         {
+            if !self.dry {
+                std::fs::create_dir_all(dir)?;
+            }
             return Ok((dir.clone(), stem.clone()));
         }
         let (dir, stem) = match self.state.location(&asset.uuid)? {
@@ -179,25 +213,30 @@ impl<'a> Exporter<'a> {
                     .cfg
                     .export_dir
                     .join(template::render(&self.cfg.path, |n, i| zoned.field(n, i)));
-                if !self.dry {
-                    std::fs::create_dir_all(&dir)?;
-                }
                 let stem = pick_stem(self.state, self.cfg, &zoned, &dir, !self.dry)?;
                 (dir, stem)
             }
         };
+        if !self.dry {
+            std::fs::create_dir_all(&dir)?;
+        }
         self.location = Some((asset.uuid.clone(), dir.clone(), stem.clone()));
         Ok((dir, stem))
     }
 
     pub(crate) fn exported(&self, uuid: &str, kind: Kind) -> Result<bool> {
-        Ok(self.state.exported(uuid, kind)?.is_some())
+        Ok(self
+            .state
+            .exported(uuid, kind)?
+            .is_some_and(|path| Path::new(&path).is_file()))
     }
 
-    pub(crate) fn temp_path(&self, uuid: &str, kind: Kind) -> Result<PathBuf> {
-        let dir = self.cfg.export_dir.join(".tmp");
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir.join(format!("{uuid}.{}", kind.name())))
+    pub(crate) fn temp_path(&mut self, uuid: &str, kind: Kind) -> Result<PathBuf> {
+        let dir = match &self.temp_dir {
+            Some(dir) => dir,
+            None => self.temp_dir.insert(tempfile::tempdir()?),
+        };
+        Ok(dir.path().join(format!("{uuid}.{}", kind.name())))
     }
 
     pub(crate) fn place(
@@ -209,17 +248,25 @@ impl<'a> Exporter<'a> {
         hash: &str,
     ) -> Result<()> {
         let asset = &self.resolve(asset, Some(tmp))?.0;
-        let target = match self.state.duplicate(hash)? {
-            Some(_) => None,
-            None => {
-                let (dir, stem) = self.location(asset)?;
-                Some(dir.join(kind.file_name(&stem, filename)))
-            }
-        };
         let uuid = &asset.uuid;
-        let placed = self.state.place(uuid, kind, hash, tmp, || {
-            link_unique(tmp, target.as_deref().context("placed twice")?, uuid, hash)
-        })?;
+        let placed =
+            match self
+                .state
+                .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
+                    Ok(None)
+                })? {
+                Some(placed) => placed,
+                None => {
+                    let (dir, stem) = self.location(asset)?;
+                    let target = dir.join(kind.file_name(&stem, filename));
+                    let preserve_existing = self.state.exported(uuid, kind)?.is_some();
+                    self.state
+                        .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
+                            link_unique(tmp, &target, uuid, hash, preserve_existing).map(Some)
+                        })?
+                        .context("missing placement")?
+                }
+            };
         match placed {
             Placed::New(p) => {
                 self.summary.exported += 1;
@@ -286,7 +333,10 @@ impl<'a> Exporter<'a> {
         }
         let xmp = crate::photo::xmp::write(&asset);
         if self.cfg.sidecar {
-            std::fs::write(dir.join(format!("{stem}.xmp")), &xmp)?;
+            let path = dir.join(format!("{stem}.xmp"));
+            if std::fs::read(&path).ok().as_deref() != Some(xmp.as_bytes()) {
+                std::fs::write(path, &xmp)?;
+            }
         }
         if self.cfg.embed {
             self.embed(&asset.uuid, &xmp)?;
@@ -344,8 +394,18 @@ impl<'a> Exporter<'a> {
                 continue;
             }
             if self.exported(&asset.uuid, r.kind)? {
-                self.summary.skipped += 1;
-                continue;
+                let previous = self.state.revision(&asset.uuid, r.kind)?;
+                if previous.is_none() || asset.revision.is_none() || previous == asset.revision {
+                    if !self.dry
+                        && previous.is_none()
+                        && let Some(revision) = asset.revision.as_deref()
+                    {
+                        self.state
+                            .baseline_revision(&asset.uuid, r.kind, revision)?;
+                    }
+                    self.summary.skipped += 1;
+                    continue;
+                }
             }
             if self.dry {
                 self.plan(asset, r.kind, &r.filename)?;
@@ -360,7 +420,6 @@ impl<'a> Exporter<'a> {
     }
 
     pub(crate) fn finish(self) -> Summary {
-        let _ = std::fs::remove_dir(self.cfg.export_dir.join(".tmp"));
         self.summary
     }
 
@@ -499,6 +558,7 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use crate::sources::Resource;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn writes_what_it_hashes() {
@@ -509,6 +569,47 @@ mod tests {
     }
 
     #[test]
+    fn stages_outside_destination_and_cleans_up() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = Config::parse(&format!(
+            "export_dir = {}",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
+        ))
+        .unwrap();
+        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let mut ex = Exporter::new(&cfg, &state, &|_| {}, false);
+        let mut other = Exporter::new(&cfg, &state, &|_| {}, false);
+        let tmp = ex.temp_path("uuid", Kind::Original).unwrap();
+        let other_tmp = other.temp_path("uuid", Kind::Original).unwrap();
+        assert_ne!(tmp, other_tmp);
+        assert!(!tmp.starts_with(out.path()));
+        assert!(tmp.starts_with(std::env::temp_dir()));
+        assert!(!out.path().join(".tmp").exists());
+        std::fs::write(&tmp, b"unfinished").unwrap();
+        std::fs::write(&other_tmp, b"unfinished").unwrap();
+        ex.finish();
+        drop(other);
+        assert!(!tmp.parent().unwrap().exists());
+        assert!(!other_tmp.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn copies_without_overwriting_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dest = dir.path().join("destination");
+        std::fs::write(&src, b"original").unwrap();
+        copy_new(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+        std::fs::write(&src, b"replacement").unwrap();
+        assert_eq!(
+            copy_new(&src, &dest).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+    }
+
+    #[test]
     fn adopts_identical_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let (tmp, dest) = (dir.path().join("t"), dir.path().join("IMG_1.jpg"));
@@ -516,14 +617,14 @@ mod tests {
         std::fs::write(&tmp, b"same").unwrap();
         let hash = blake3::hash(b"same").to_hex().to_string();
         assert_eq!(
-            link_unique(&tmp, &dest, "uuid1234", &hash).unwrap(),
+            link_unique(&tmp, &dest, "uuid1234", &hash, false).unwrap(),
             Placed::Duplicate(dest.to_string_lossy().into_owned())
         );
         assert!(!tmp.exists());
         std::fs::write(&tmp, b"other").unwrap();
         let other = blake3::hash(b"other").to_hex().to_string();
         assert_eq!(
-            link_unique(&tmp, &dest, "uuid1234", &other).unwrap(),
+            link_unique(&tmp, &dest, "uuid1234", &other, false).unwrap(),
             Placed::New(
                 dir.path()
                     .join("IMG_1_uuid1234.jpg")
@@ -561,6 +662,461 @@ mod tests {
             taken: chrono::DateTime::parse_from_rfc3339("2001-01-01T00:00:00Z").ok(),
             ..Default::default()
         }
+    }
+
+    struct Changing {
+        bytes: &'static [u8],
+        writes: AtomicUsize,
+        fail: bool,
+    }
+
+    impl Source for Changing {
+        fn write(&self, _id: &str, _index: usize, dest: &Path) -> Result<String> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                std::fs::write(dest, b"partial")?;
+                anyhow::bail!("download failed");
+            }
+            write_hashed(self.bytes, dest)
+        }
+    }
+
+    fn revision_config(out: &Path) -> Config {
+        Config::parse(&format!(
+            "export_dir = {}\npath = \"{{take.year}}\"\nembed = false\nconcurrency = 1",
+            toml::Value::String(out.to_string_lossy().into_owned())
+        ))
+        .unwrap()
+    }
+
+    fn run_revision(
+        src: &Changing,
+        cfg: &Config,
+        state: &State,
+        revision: &str,
+        dry: bool,
+    ) -> Summary {
+        let mut a = asset("A", "IMG_1.jpg", "");
+        a.revision = Some(revision.into());
+        run(
+            src,
+            cfg,
+            state,
+            &HashMap::from([("A".into(), a)]),
+            &[("A".into(), "A".into())],
+            &|_| {},
+            dry,
+        )
+    }
+
+    #[test]
+    fn baselines_legacy_exports_without_downloading_and_detects_later_changes() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = revision_config(out.path());
+        let database = out.path().join("state.sqlite");
+        let state = State::open(&database).unwrap();
+        let mut src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        Exporter::new(&cfg, &state, &|_| {}, false)
+            .asset(&src, &asset("A", "IMG_1.jpg", ""), "A")
+            .unwrap();
+        let original = state.exported("A", Kind::Original).unwrap().unwrap();
+        assert_eq!(state.revision("A", Kind::Original).unwrap(), None);
+        drop(state);
+        let state = State::open(&database).unwrap();
+
+        src.fail = true;
+        let dry = run_revision(&src, &cfg, &state, "1", true);
+        assert_eq!((dry.skipped, dry.exported, dry.errors), (1, 0, 0));
+        assert_eq!(state.revision("A", Kind::Original).unwrap(), None);
+        for _ in 0..2 {
+            let result = run_revision(&src, &cfg, &state, "1", false);
+            assert_eq!(
+                (
+                    result.skipped,
+                    result.exported,
+                    result.duplicates,
+                    result.errors
+                ),
+                (1, 0, 0, 0)
+            );
+        }
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.revision("A", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(original.as_str())
+        );
+
+        src.fail = false;
+        src.bytes = b"two";
+        let changed = run_revision(&src, &cfg, &state, "2", false);
+        assert_eq!(
+            (changed.exported, changed.duplicates, changed.errors),
+            (1, 0, 0)
+        );
+        assert_eq!(src.writes.load(Ordering::Relaxed), 2);
+        assert_eq!(std::fs::read(&original).unwrap(), b"one");
+        let current = state.exported("A", Kind::Original).unwrap().unwrap();
+        assert_ne!(current, original);
+        assert_eq!(std::fs::read(current).unwrap(), b"two");
+    }
+
+    #[test]
+    fn legacy_baselines_do_not_skip_missing_or_unexported_resources() {
+        for missing in [false, true] {
+            let out = tempfile::tempdir().unwrap();
+            let cfg = revision_config(out.path());
+            let state = State::open(&out.path().join("state.sqlite")).unwrap();
+            let src = Fake(HashMap::from([(
+                "A",
+                vec![(Kind::Original, "IMG_1.jpg", b"one".as_slice())],
+            )]));
+            let mut a = asset("A", "IMG_1.jpg", "");
+            Exporter::new(&cfg, &state, &|_| {}, false)
+                .asset(&src, &a, "A")
+                .unwrap();
+            let original = state.exported("A", Kind::Original).unwrap().unwrap();
+            if missing {
+                std::fs::remove_file(&original).unwrap();
+            }
+            a.revision = Some("1".into());
+            let src = Fake(HashMap::from([(
+                "A",
+                vec![
+                    (Kind::Original, "IMG_1.jpg", b"one".as_slice()),
+                    (Kind::PairedVideo, "IMG_1.mov", b"video".as_slice()),
+                ],
+            )]));
+            let mut exporter = Exporter::new(&cfg, &state, &|_| {}, false);
+            exporter.asset(&src, &a, "A").unwrap();
+            let result = exporter.finish();
+            assert_eq!(
+                (
+                    result.exported,
+                    result.skipped,
+                    result.duplicates,
+                    result.errors
+                ),
+                if missing { (2, 0, 0, 0) } else { (1, 1, 0, 0) }
+            );
+            for kind in [Kind::Original, Kind::PairedVideo] {
+                assert_eq!(state.revision("A", kind).unwrap().as_deref(), Some("1"));
+                assert!(Path::new(&state.exported("A", kind).unwrap().unwrap()).is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn exports_revisions_skips_unchanged_and_repairs_missing_files() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = revision_config(out.path());
+        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let mut src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        let first = run_revision(&src, &cfg, &state, "1", false);
+        assert_eq!((first.exported, first.errors), (1, 0));
+        let first_path = state.exported("A", Kind::Original).unwrap().unwrap();
+        let unchanged = run_revision(&src, &cfg, &state, "1", false);
+        assert_eq!((unchanged.skipped, unchanged.errors), (1, 0));
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+
+        src.bytes = b"two";
+        let dry = run_revision(&src, &cfg, &state, "2", true);
+        assert_eq!((dry.exported, dry.errors), (1, 0));
+        assert_eq!(
+            state.revision("A", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(first_path.as_str())
+        );
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+
+        let mut previous = vec![(first_path, b"one".as_slice())];
+        for (revision, bytes) in [("2", b"two".as_slice()), ("3", b"three"), ("4", b"four")] {
+            src.bytes = bytes;
+            let changed = run_revision(&src, &cfg, &state, revision, false);
+            assert_eq!((changed.exported, changed.errors), (1, 0));
+            let path = state.exported("A", Kind::Original).unwrap().unwrap();
+            assert!(previous.iter().all(|(old, _)| *old != path));
+            previous.push((path, bytes));
+        }
+        for (path, bytes) in &previous {
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
+        let latest = previous.last().unwrap().0.clone();
+        std::fs::remove_file(&latest).unwrap();
+        let repaired = run_revision(&src, &cfg, &state, "4", false);
+        assert_eq!((repaired.exported, repaired.errors), (1, 0));
+        let path = state.exported("A", Kind::Original).unwrap().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"four");
+        assert_eq!(src.writes.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn repairs_deleted_export_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = revision_config(&root.path().join("out"));
+        let state = State::open(&root.path().join("state.sqlite")).unwrap();
+        let src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        assert_eq!(run_revision(&src, &cfg, &state, "1", false).exported, 1);
+        let original = state.exported("A", Kind::Original).unwrap().unwrap();
+        std::fs::remove_dir_all(&cfg.export_dir).unwrap();
+        let dry = run_revision(&src, &cfg, &state, "1", true);
+        assert_eq!((dry.exported, dry.errors), (1, 0));
+        assert!(!cfg.export_dir.exists());
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+        let repaired = run_revision(&src, &cfg, &state, "1", false);
+        assert_eq!((repaired.exported, repaired.errors), (1, 0));
+        assert_eq!(std::fs::read(&original).unwrap(), b"one");
+
+        let mut ex = Exporter::new(&cfg, &state, &|_| {}, false);
+        let a = asset("A", "IMG_1.jpg", "");
+        ex.location(&a).unwrap();
+        std::fs::remove_dir_all(&cfg.export_dir).unwrap();
+        ex.asset(&src, &a, "A").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"one");
+    }
+
+    #[test]
+    fn maintains_current_and_historical_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = revision_config(&root.path().join("out"));
+        let database = root.path().join("state.sqlite");
+        let state = State::open(&database).unwrap();
+        let mut src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        let mut versions = Vec::new();
+        for (revision, bytes) in [("1", b"one".as_slice()), ("2", b"two"), ("3", b"three")] {
+            src.bytes = bytes;
+            assert_eq!(
+                run_revision(&src, &cfg, &state, revision, false).exported,
+                1
+            );
+            versions.push((state.exported("A", Kind::Original).unwrap().unwrap(), bytes));
+        }
+        let hash = blake3::hash(b"one").to_hex().to_string();
+        state
+            .record("B", Kind::Original, &hash, &versions[0].0)
+            .unwrap();
+        drop(state);
+        let state = State::open(&database).unwrap();
+        assert_eq!(state.paths_of("A").unwrap().len(), 3);
+        for dry in [true, false] {
+            let cleaned = crate::clean::run(&cfg, &state, true, &|_| {}, dry).unwrap();
+            assert_eq!(
+                (
+                    cleaned.dead_rows,
+                    cleaned.orphan_files,
+                    cleaned.removed_files
+                ),
+                (0, 0, 0)
+            );
+        }
+        cfg.path = "moved/{take.year}".into();
+        cfg.filename = "renamed".into();
+        let dry = crate::consolidate::run(&cfg, &state, &|_| {}, true).unwrap();
+        assert_eq!(dry.moved, 1);
+        assert!(versions.iter().all(|(p, _)| Path::new(p).is_file()));
+        let moved = crate::consolidate::run(&cfg, &state, &|_| {}, false).unwrap();
+        assert_eq!(moved.moved, 1);
+        let dir = cfg.export_dir.join("moved/2001");
+        for (old, bytes) in &versions {
+            let name = Path::new(old)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replacen("IMG_1", "renamed", 1);
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+            assert!(!Path::new(old).exists());
+        }
+        assert!(dir.join("renamed.xmp").is_file());
+        assert_eq!(
+            state.exported("B", Kind::Original).unwrap().unwrap(),
+            dir.join("renamed.jpg").to_string_lossy()
+        );
+        assert_eq!(
+            state.duplicate(&hash).unwrap(),
+            state.exported("B", Kind::Original).unwrap()
+        );
+        let latest = state.exported("A", Kind::Original).unwrap().unwrap();
+        std::fs::remove_file(dir.join("renamed.jpg")).unwrap();
+        let cleaned = crate::clean::run(&cfg, &state, true, &|_| {}, false).unwrap();
+        assert_eq!(
+            (
+                cleaned.dead_rows,
+                cleaned.removed_files,
+                cleaned.removed_sidecars
+            ),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(latest.as_str())
+        );
+        assert_eq!(state.paths_of("A").unwrap().len(), 2);
+        std::fs::remove_file(&latest).unwrap();
+        let cleaned = crate::clean::run(&cfg, &state, true, &|_| {}, false).unwrap();
+        assert_eq!(
+            (
+                cleaned.dead_rows,
+                cleaned.removed_assets,
+                cleaned.removed_sidecars
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(state.paths_of("A").unwrap().len(), 1);
+        assert!(dir.join("renamed.xmp").is_file());
+        let repaired = run_revision(&src, &cfg, &state, "3", false);
+        assert_eq!((repaired.exported, repaired.errors), (1, 0));
+        assert_eq!(state.paths_of("A").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn leaves_unchanged_sidecar_untouched_but_updates_metadata() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = revision_config(out.path());
+        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        assert_eq!(run_revision(&src, &cfg, &state, "1", false).errors, 0);
+        let path = out.path().join("2001/IMG_1.xmp");
+        let original = std::fs::read(&path).unwrap();
+        let before = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        assert_eq!(run_revision(&src, &cfg, &state, "1", false).errors, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+
+        let mut a = asset("A", "IMG_1.jpg", "");
+        a.revision = Some("1".into());
+        a.title = Some("Updated title".into());
+        let changed = run(
+            &src,
+            &cfg,
+            &state,
+            &HashMap::from([("A".into(), a)]),
+            &[("A".into(), "A".into())],
+            &|_| {},
+            false,
+        );
+        assert_eq!((changed.skipped, changed.errors), (1, 0));
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+        assert_ne!(std::fs::read(&path).unwrap(), original);
+        let stored = crate::photo::xmp::read(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored.title.as_deref(), Some("Updated title"));
+        assert_ne!(std::fs::metadata(path).unwrap().modified().unwrap(), before);
+    }
+
+    #[test]
+    fn changed_asset_preserves_shared_and_unrelated_files() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = revision_config(out.path());
+        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let mut src = Changing {
+            bytes: b"shared",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        let assets = ["A", "B"].map(|uuid| {
+            let mut a = asset(uuid, "IMG_1.jpg", "");
+            a.revision = Some("1".into());
+            (uuid.to_owned(), a)
+        });
+        let first = run(
+            &src,
+            &cfg,
+            &state,
+            &HashMap::from(assets),
+            &[("A".into(), "A".into()), ("B".into(), "B".into())],
+            &|_| {},
+            false,
+        );
+        assert_eq!((first.exported, first.duplicates, first.errors), (1, 1, 0));
+        let shared = state.exported("B", Kind::Original).unwrap().unwrap();
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(shared.as_str())
+        );
+        std::fs::remove_file(&shared).unwrap();
+        assert_eq!(run_revision(&src, &cfg, &state, "1", false).errors, 0);
+        assert_eq!(std::fs::read(&shared).unwrap(), b"shared");
+
+        let unrelated = out.path().join("2001/IMG_1_A.jpg");
+        std::fs::write(&unrelated, b"new").unwrap();
+        src.bytes = b"new";
+        let changed = run_revision(&src, &cfg, &state, "2", false);
+        assert_eq!((changed.exported, changed.errors), (1, 0));
+        let current = state.exported("A", Kind::Original).unwrap().unwrap();
+        assert_ne!(current, shared);
+        assert_ne!(Path::new(&current), unrelated);
+        assert_eq!(std::fs::read(&current).unwrap(), b"new");
+        assert_eq!(std::fs::read(shared).unwrap(), b"shared");
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"new");
+    }
+
+    #[test]
+    fn failed_revision_retries_without_advancing_saved_version() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = revision_config(out.path());
+        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let mut src = Changing {
+            bytes: b"old",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        assert_eq!(run_revision(&src, &cfg, &state, "1", false).errors, 0);
+        let old = state.exported("A", Kind::Original).unwrap().unwrap();
+        src.bytes = b"new";
+        src.fail = true;
+        assert_eq!(run_revision(&src, &cfg, &state, "2", false).errors, 1);
+        assert_eq!(
+            state.revision("A", Kind::Original).unwrap().as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(old.as_str())
+        );
+        assert_eq!(std::fs::read(&old).unwrap(), b"old");
+        src.fail = false;
+        let retried = run_revision(&src, &cfg, &state, "2", false);
+        assert_eq!((retried.exported, retried.errors), (1, 0));
+        assert_eq!(
+            state.revision("A", Kind::Original).unwrap().as_deref(),
+            Some("2")
+        );
+        assert_ne!(state.exported("A", Kind::Original).unwrap().unwrap(), old);
     }
 
     /// Little-endian TIFF whose IFD0 holds only ModifyDate.

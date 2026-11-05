@@ -28,6 +28,29 @@ public sealed partial class SettingsPage : UserControl
     public SettingsPage()
     {
         InitializeComponent();
+        Loaded += (_, _) => ReadLoginSetting();
+    }
+
+    internal bool KeepRunningAfterClose => settings?.KeepRunningAfterClose == true;
+
+    internal void ShowBackgroundError(string message) => ShowError(message);
+
+    private void ReadLoginSetting()
+    {
+        var wasLoading = loading;
+        loading = true;
+        try
+        {
+            OpenAtLoginSwitch.IsOn = Startup.Enabled;
+        }
+        catch (Exception e)
+        {
+            ShowError($"Could not read login settings: {e.Message}");
+        }
+        finally
+        {
+            loading = wasLoading;
+        }
     }
 
     private void ShowError(string message)
@@ -157,6 +180,8 @@ public sealed partial class SettingsPage : UserControl
         KeywordsBox.Text = s.Keywords;
         EditsBox.SelectedIndex = s.Edits ? 1 : 0;
         MetadataBox.SelectedIndex = Array.IndexOf(Copy.MetadataChoices, s.Metadata);
+        IntervalBox.Value = s.CheckIntervalMinutes;
+        KeepRunningSwitch.IsOn = s.KeepRunningAfterClose;
         loading = false;
         ShowSummaries();
         UpdatePreviews();
@@ -183,17 +208,18 @@ public sealed partial class SettingsPage : UserControl
         {
             return;
         }
-        settings = next;
-        ExportCard.Description = next.ExportDir;
-        ShowSummaries();
         try
         {
             core.SaveSettings(next);
+            settings = next;
+            ExportCard.Description = next.ExportDir;
+            ShowSummaries();
             ErrorBar.IsOpen = false;
         }
         catch (CoreException e)
         {
             ShowError(Copy.ErrorText(e));
+            return;
         }
         SchedulePreviews();
         saved();
@@ -248,6 +274,32 @@ public sealed partial class SettingsPage : UserControl
 
     private void Wire()
     {
+        KeepRunningSwitch.Toggled += (_, _) => Edit(s => s with { KeepRunningAfterClose = KeepRunningSwitch.IsOn });
+        IntervalBox.ValueChanged += (_, _) =>
+        {
+            if (double.IsFinite(IntervalBox.Value) && IntervalBox.Value >= 1 && IntervalBox.Value <= 1440)
+            {
+                var minutes = (uint)Math.Round(IntervalBox.Value, MidpointRounding.AwayFromZero);
+                IntervalBox.Value = minutes;
+                Edit(s => s with { CheckIntervalMinutes = minutes });
+            }
+        };
+        OpenAtLoginSwitch.Toggled += (_, _) =>
+        {
+            if (loading)
+            {
+                return;
+            }
+            try
+            {
+                Startup.Enabled = OpenAtLoginSwitch.IsOn;
+            }
+            catch (Exception e)
+            {
+                ShowError($"Could not change login settings: {e.Message}");
+                ReadLoginSetting();
+            }
+        };
         ExportDirBrowse.Click += async (_, _) =>
         {
             if (await Pickers.Folder(this) is { } path)

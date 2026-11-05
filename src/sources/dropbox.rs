@@ -1,5 +1,5 @@
 use super::oauth::{Provider, Session, Token, now};
-use super::{Source, is_media, is_video};
+use super::{AuthMode, Source, is_media, is_video};
 use crate::photo::Asset;
 use crate::{Event, Progress};
 use anyhow::{Context, Result, bail};
@@ -85,6 +85,10 @@ fn entry_asset(v: &Value) -> Option<Asset> {
     }
     Some(Asset {
         uuid: v["id"].as_str()?.to_owned(),
+        revision: v["content_hash"]
+            .as_str()
+            .or_else(|| v["rev"].as_str())
+            .map(str::to_owned),
         filename: name.to_owned(),
         uploaded: ["client_modified", "server_modified"]
             .into_iter()
@@ -198,7 +202,12 @@ fn browser_login(client: &Client, app_key: &str, progress: Progress) -> Result<T
 }
 
 impl Dropbox {
-    pub(crate) fn connect(app_key: &str, token_path: &Path, progress: Progress) -> Result<Dropbox> {
+    pub(crate) fn connect(
+        app_key: &str,
+        token_path: &Path,
+        progress: Progress,
+        auth: AuthMode,
+    ) -> Result<Dropbox> {
         anyhow::ensure!(
             !app_key.trim().is_empty(),
             "set dropbox_app_key in the config to your Dropbox app's key"
@@ -207,7 +216,7 @@ impl Dropbox {
             app_key: app_key.to_owned(),
         };
         Ok(Dropbox {
-            session: Session::connect(provider, token_path, progress)?,
+            session: Session::connect(provider, token_path, progress, auth)?,
         })
     }
 
@@ -279,9 +288,11 @@ mod tests {
     fn maps_entries() {
         let a = entry_asset(&json!({
             ".tag": "file", "id": "id:abc", "name": "IMG_1.HEIC",
+            "content_hash": "content-1", "rev": "version-1",
             "client_modified": "2019-05-03T18:27:59Z", "server_modified": "2019-06-01T00:00:00Z"
         }))
         .unwrap();
+        assert_eq!(a.revision.as_deref(), Some("content-1"));
         assert_eq!(
             (a.uuid.as_str(), a.filename.as_str()),
             ("id:abc", "IMG_1.HEIC")
@@ -294,11 +305,12 @@ mod tests {
             a.taken.is_none(),
             "taken comes from the file's EXIF at export"
         );
-        assert!(
-            entry_asset(&json!({".tag": "file", "id": "id:v", "name": "a.MOV"}))
-                .unwrap()
-                .video
-        );
+        let video = entry_asset(
+            &json!({".tag": "file", "id": "id:v", "name": "a.MOV", "rev": "version-1"}),
+        )
+        .unwrap();
+        assert!(video.video);
+        assert_eq!(video.revision.as_deref(), Some("version-1"));
         assert!(entry_asset(&json!({".tag": "folder", "id": "id:f", "name": "x.jpg"})).is_none());
         assert!(entry_asset(&json!({".tag": "deleted", "name": "x.jpg"})).is_none());
         assert!(entry_asset(&json!({".tag": "file", "id": "id:t", "name": "notes.txt"})).is_none());

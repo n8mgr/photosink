@@ -1,5 +1,6 @@
+use super::AuthMode;
 use crate::Progress;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -55,14 +56,22 @@ impl<P: Provider> Session<P> {
         Ok(access)
     }
 
-    /// Uses the token saved at `path`, or signs in when there is none.
-    pub(super) fn connect(provider: P, path: &Path, progress: Progress) -> Result<Session<P>> {
+    /// Uses the saved token, allowing sign-in only for interactive runs.
+    pub(super) fn connect(
+        provider: P,
+        path: &Path,
+        progress: Progress,
+        auth: AuthMode,
+    ) -> Result<Session<P>> {
         let client = Client::builder()
             .timeout(Duration::from_secs(3600))
             .build()?;
         let token = match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(_) => provider.login(&client, progress)?,
+            Err(_) if auth == AuthMode::Interactive => provider.login(&client, progress)?,
+            Err(error) => {
+                return Err(error).context("saved sign-in is required for unattended export");
+            }
         };
         let session = Session {
             client,
@@ -139,6 +148,139 @@ pub(super) fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Calls {
+        login: AtomicUsize,
+        refresh: AtomicUsize,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeProvider {
+        calls: Arc<Calls>,
+        refresh_error: bool,
+    }
+
+    impl Provider for FakeProvider {
+        fn login(&self, _client: &Client, _progress: Progress) -> Result<Token> {
+            self.calls.login.fetch_add(1, Ordering::Relaxed);
+            Ok(Token {
+                access_token: "signed-in".into(),
+                refresh_token: "refresh".into(),
+                expires_at: now() + 3600,
+            })
+        }
+
+        fn refresh(&self, _client: &Client, refresh_token: &str) -> Result<Token> {
+            self.calls.refresh.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(refresh_token, "refresh");
+            if self.refresh_error {
+                bail!("refresh rejected");
+            }
+            Ok(Token {
+                access_token: "refreshed".into(),
+                refresh_token: "rotated".into(),
+                expires_at: now() + 3600,
+            })
+        }
+    }
+
+    fn save_token(path: &Path, expires_at: u64) {
+        let token = Token {
+            access_token: "cached".into(),
+            refresh_token: "refresh".into(),
+            expires_at,
+        };
+        std::fs::write(path, serde_json::to_vec(&token).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unattended_requires_valid_saved_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        let unreadable = dir.path().join("directory");
+        std::fs::create_dir(&unreadable).unwrap();
+        let invalid = dir.path().join("invalid.json");
+        std::fs::write(&invalid, "invalid JSON").unwrap();
+        let provider = FakeProvider::default();
+        for path in [&missing, &unreadable, &invalid] {
+            assert!(
+                Session::connect(provider.clone(), path, &|_| {}, AuthMode::Unattended).is_err()
+            );
+        }
+        assert!(!missing.exists());
+        assert_eq!(provider.calls.login.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.calls.refresh.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unattended_uses_cached_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        save_token(&path, now() + 3600);
+        let provider = FakeProvider::default();
+        let session =
+            Session::connect(provider.clone(), &path, &|_| {}, AuthMode::Unattended).unwrap();
+        assert_eq!(session.access_token().unwrap(), "cached");
+        assert_eq!(provider.calls.login.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.calls.refresh.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unattended_refreshes_and_saves_expired_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        save_token(&path, 0);
+        let provider = FakeProvider::default();
+        let session =
+            Session::connect(provider.clone(), &path, &|_| {}, AuthMode::Unattended).unwrap();
+        assert_eq!(session.access_token().unwrap(), "refreshed");
+        let saved: Token = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.access_token, "refreshed");
+        assert_eq!(saved.refresh_token, "rotated");
+        assert!(saved.expires_at > now() + 60);
+        assert_eq!(session.access_token().unwrap(), "refreshed");
+        assert_eq!(provider.calls.login.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.calls.refresh.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unattended_refresh_failure_does_not_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        save_token(&path, 0);
+        let provider = FakeProvider {
+            refresh_error: true,
+            ..Default::default()
+        };
+        let session =
+            Session::connect(provider.clone(), &path, &|_| {}, AuthMode::Unattended).unwrap();
+        assert_eq!(
+            session.access_token().unwrap_err().to_string(),
+            "refresh rejected"
+        );
+        let saved: Token = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.access_token, "cached");
+        assert_eq!(saved.refresh_token, "refresh");
+        assert_eq!(provider.calls.login.load(Ordering::Relaxed), 0);
+        assert_eq!(provider.calls.refresh.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn interactive_signs_in_without_saved_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        let provider = FakeProvider::default();
+        let session =
+            Session::connect(provider.clone(), &path, &|_| {}, AuthMode::Interactive).unwrap();
+        assert_eq!(session.access_token().unwrap(), "signed-in");
+        let saved: Token = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.access_token, "signed-in");
+        assert_eq!(provider.calls.login.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.calls.refresh.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn reads_saved_token_files() {

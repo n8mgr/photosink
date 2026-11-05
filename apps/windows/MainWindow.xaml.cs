@@ -1,3 +1,4 @@
+using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using System;
@@ -14,6 +15,8 @@ public sealed partial class MainWindow : Window
     private readonly Dictionary<Tab, NavigationViewItem> items = new();
     private Tab? lastRun;
     private bool closed;
+    private bool quitting;
+    private readonly BackgroundWindow background;
 
     public MainWindow()
     {
@@ -24,9 +27,29 @@ public sealed partial class MainWindow : Window
         AppTitleBar.PaneToggleRequested += (_, _) => Nav.IsPaneOpen = !Nav.IsPaneOpen;
 
         core = new Core(new CoreListener(DispatcherQueue, OnChanged));
+        background = new BackgroundWindow(
+            WinRT.Interop.WindowNative.GetWindowHandle(this),
+            () => DispatcherQueue.TryEnqueue(Open),
+            () => DispatcherQueue.TryEnqueue(Quit));
+        AppWindow.Closing += (_, e) =>
+        {
+            if (!quitting && SettingsView.KeepRunningAfterClose)
+            {
+                e.Cancel = true;
+                if (background.SetVisible(true))
+                {
+                    AppWindow.Hide();
+                }
+                else
+                {
+                    SettingsView.ShowBackgroundError("Could not add the notification area icon. Photosink will stay open.");
+                }
+            }
+        };
         Closed += (_, _) =>
         {
             closed = true;
+            background.Dispose();
             core.Dispose();
         };
 
@@ -61,6 +84,32 @@ public sealed partial class MainWindow : Window
             Nav.SelectedItem = items.Values.First();
         }
         RefreshStatus();
+        RefreshBackground();
+    }
+
+    private void Open()
+    {
+        AppWindow.Show();
+        if (AppWindow.Presenter is OverlappedPresenter { State: OverlappedPresenterState.Minimized } presenter)
+        {
+            presenter.Restore();
+        }
+        Activate();
+        BackgroundWindow.SetForegroundWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
+    }
+
+    private void Quit()
+    {
+        quitting = true;
+        Close();
+    }
+
+    private void RefreshBackground()
+    {
+        if (!background.SetVisible(SettingsView.KeepRunningAfterClose))
+        {
+            SettingsView.ShowBackgroundError("Could not add the notification area icon.");
+        }
     }
 
     private static string Glyph(Tab tab) => tab switch
@@ -115,10 +164,6 @@ public sealed partial class MainWindow : Window
         var status = core.Status();
         var running = core.Running();
         lastRun = running ?? lastRun;
-        foreach (var (tab, item) in items)
-        {
-            item.IsEnabled = running is null || running == tab;
-        }
         foreach (var (tab, page) in pages)
         {
             page.RefreshStatus(status, running, lastRun is null || lastRun == tab);
@@ -127,6 +172,7 @@ public sealed partial class MainWindow : Window
 
     private void RefreshTasks()
     {
+        RefreshBackground();
         foreach (var page in pages.Values)
         {
             page.RefreshTask();
