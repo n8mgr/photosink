@@ -51,6 +51,17 @@ pub(crate) fn write_hashed(mut src: impl Read, dest: &Path) -> Result<String> {
     }
 }
 
+fn copy_new(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(src)?;
+    let mut file = std::fs::File::create_new(dest)?;
+    let result = std::io::copy(&mut src, &mut file).map(|_| ());
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
 fn link_unique(
     tmp: &Path,
     dest: &Path,
@@ -73,7 +84,14 @@ fn link_unique(
             2 => dest.with_file_name(format!("{stem}_{id}_{version}{ext}")),
             _ => dest.with_file_name(format!("{stem}_{id}_{version}_{n}{ext}")),
         };
-        match std::fs::hard_link(tmp, &candidate) {
+        let placed = std::fs::hard_link(tmp, &candidate).or_else(|e| {
+            if e.kind() == ErrorKind::CrossesDevices {
+                copy_new(tmp, &candidate)
+            } else {
+                Err(e)
+            }
+        });
+        match placed {
             Ok(()) => {
                 std::fs::remove_file(tmp)?;
                 return Ok(Placed::New(candidate.to_string_lossy().into_owned()));
@@ -135,6 +153,7 @@ pub(crate) struct Exporter<'a> {
     state: &'a State,
     progress: Progress<'a>,
     location: Option<(String, PathBuf, String)>,
+    temp_dir: Option<tempfile::TempDir>,
     pos: (usize, usize),
     dry: bool,
     pub(crate) summary: Summary,
@@ -154,6 +173,7 @@ impl<'a> Exporter<'a> {
             state,
             progress,
             location: None,
+            temp_dir: None,
             pos: (0, 0),
             dry,
             summary: Summary::default(),
@@ -208,10 +228,12 @@ impl<'a> Exporter<'a> {
             .is_some_and(|path| Path::new(&path).is_file()))
     }
 
-    pub(crate) fn temp_path(&self, uuid: &str, kind: Kind) -> Result<PathBuf> {
-        let dir = self.cfg.export_dir.join(".tmp");
-        std::fs::create_dir_all(&dir)?;
-        Ok(dir.join(format!("{uuid}.{}", kind.name())))
+    pub(crate) fn temp_path(&mut self, uuid: &str, kind: Kind) -> Result<PathBuf> {
+        let dir = match &self.temp_dir {
+            Some(dir) => dir,
+            None => self.temp_dir.insert(tempfile::tempdir()?),
+        };
+        Ok(dir.path().join(format!("{uuid}.{}", kind.name())))
     }
 
     pub(crate) fn place(
@@ -396,7 +418,6 @@ impl<'a> Exporter<'a> {
     }
 
     pub(crate) fn finish(self) -> Summary {
-        let _ = std::fs::remove_dir(self.cfg.export_dir.join(".tmp"));
         self.summary
     }
 
@@ -543,6 +564,47 @@ mod tests {
         let q = dir.path().join("g");
         write_hashed(b"hello".as_slice(), &q).unwrap();
         assert_eq!(std::fs::read(q).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn stages_outside_destination_and_cleans_up() {
+        let out = tempfile::tempdir().unwrap();
+        let cfg = Config::parse(&format!(
+            "export_dir = {}",
+            toml::Value::String(out.path().to_string_lossy().into_owned())
+        ))
+        .unwrap();
+        let state = State::open(&out.path().join("state.sqlite")).unwrap();
+        let mut ex = Exporter::new(&cfg, &state, &|_| {}, false);
+        let mut other = Exporter::new(&cfg, &state, &|_| {}, false);
+        let tmp = ex.temp_path("uuid", Kind::Original).unwrap();
+        let other_tmp = other.temp_path("uuid", Kind::Original).unwrap();
+        assert_ne!(tmp, other_tmp);
+        assert!(!tmp.starts_with(out.path()));
+        assert!(tmp.starts_with(std::env::temp_dir()));
+        assert!(!out.path().join(".tmp").exists());
+        std::fs::write(&tmp, b"unfinished").unwrap();
+        std::fs::write(&other_tmp, b"unfinished").unwrap();
+        ex.finish();
+        drop(other);
+        assert!(!tmp.parent().unwrap().exists());
+        assert!(!other_tmp.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn copies_without_overwriting_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        let dest = dir.path().join("destination");
+        std::fs::write(&src, b"original").unwrap();
+        copy_new(&src, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+        std::fs::write(&src, b"replacement").unwrap();
+        assert_eq!(
+            copy_new(&src, &dest).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"original");
     }
 
     #[test]
