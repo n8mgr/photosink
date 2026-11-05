@@ -200,6 +200,9 @@ impl<'a> Exporter<'a> {
         if let Some((uuid, dir, stem)) = &self.location
             && uuid == &asset.uuid
         {
+            if !self.dry {
+                std::fs::create_dir_all(dir)?;
+            }
             return Ok((dir.clone(), stem.clone()));
         }
         let (dir, stem) = match self.state.location(&asset.uuid)? {
@@ -210,13 +213,13 @@ impl<'a> Exporter<'a> {
                     .cfg
                     .export_dir
                     .join(template::render(&self.cfg.path, |n, i| zoned.field(n, i)));
-                if !self.dry {
-                    std::fs::create_dir_all(&dir)?;
-                }
                 let stem = pick_stem(self.state, self.cfg, &zoned, &dir, !self.dry)?;
                 (dir, stem)
             }
         };
+        if !self.dry {
+            std::fs::create_dir_all(&dir)?;
+        }
         self.location = Some((asset.uuid.clone(), dir.clone(), stem.clone()));
         Ok((dir, stem))
     }
@@ -245,26 +248,25 @@ impl<'a> Exporter<'a> {
         hash: &str,
     ) -> Result<()> {
         let asset = &self.resolve(asset, Some(tmp))?.0;
-        let target = match self.state.duplicate(hash)? {
-            Some(_) => None,
-            None => {
-                let (dir, stem) = self.location(asset)?;
-                Some(dir.join(kind.file_name(&stem, filename)))
-            }
-        };
         let uuid = &asset.uuid;
-        let preserve_existing = self.state.exported(uuid, kind)?.is_some();
-        let placed = self
-            .state
-            .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
-                link_unique(
-                    tmp,
-                    target.as_deref().context("placed twice")?,
-                    uuid,
-                    hash,
-                    preserve_existing,
-                )
-            })?;
+        let placed =
+            match self
+                .state
+                .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
+                    Ok(None)
+                })? {
+                Some(placed) => placed,
+                None => {
+                    let (dir, stem) = self.location(asset)?;
+                    let target = dir.join(kind.file_name(&stem, filename));
+                    let preserve_existing = self.state.exported(uuid, kind)?.is_some();
+                    self.state
+                        .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
+                            link_unique(tmp, &target, uuid, hash, preserve_existing).map(Some)
+                        })?
+                        .context("missing placement")?
+                }
+            };
         match placed {
             Placed::New(p) => {
                 self.summary.exported += 1;
@@ -860,6 +862,133 @@ mod tests {
         let path = state.exported("A", Kind::Original).unwrap().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"four");
         assert_eq!(src.writes.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn repairs_deleted_export_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = revision_config(&root.path().join("out"));
+        let state = State::open(&root.path().join("state.sqlite")).unwrap();
+        let src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        assert_eq!(run_revision(&src, &cfg, &state, "1", false).exported, 1);
+        let original = state.exported("A", Kind::Original).unwrap().unwrap();
+        std::fs::remove_dir_all(&cfg.export_dir).unwrap();
+        let dry = run_revision(&src, &cfg, &state, "1", true);
+        assert_eq!((dry.exported, dry.errors), (1, 0));
+        assert!(!cfg.export_dir.exists());
+        assert_eq!(src.writes.load(Ordering::Relaxed), 1);
+        let repaired = run_revision(&src, &cfg, &state, "1", false);
+        assert_eq!((repaired.exported, repaired.errors), (1, 0));
+        assert_eq!(std::fs::read(&original).unwrap(), b"one");
+
+        let mut ex = Exporter::new(&cfg, &state, &|_| {}, false);
+        let a = asset("A", "IMG_1.jpg", "");
+        ex.location(&a).unwrap();
+        std::fs::remove_dir_all(&cfg.export_dir).unwrap();
+        ex.asset(&src, &a, "A").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"one");
+    }
+
+    #[test]
+    fn maintains_current_and_historical_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = revision_config(&root.path().join("out"));
+        let database = root.path().join("state.sqlite");
+        let state = State::open(&database).unwrap();
+        let mut src = Changing {
+            bytes: b"one",
+            writes: AtomicUsize::new(0),
+            fail: false,
+        };
+        let mut versions = Vec::new();
+        for (revision, bytes) in [("1", b"one".as_slice()), ("2", b"two"), ("3", b"three")] {
+            src.bytes = bytes;
+            assert_eq!(
+                run_revision(&src, &cfg, &state, revision, false).exported,
+                1
+            );
+            versions.push((state.exported("A", Kind::Original).unwrap().unwrap(), bytes));
+        }
+        let hash = blake3::hash(b"one").to_hex().to_string();
+        state
+            .record("B", Kind::Original, &hash, &versions[0].0)
+            .unwrap();
+        drop(state);
+        let state = State::open(&database).unwrap();
+        assert_eq!(state.paths_of("A").unwrap().len(), 3);
+        for dry in [true, false] {
+            let cleaned = crate::clean::run(&cfg, &state, true, &|_| {}, dry).unwrap();
+            assert_eq!(
+                (
+                    cleaned.dead_rows,
+                    cleaned.orphan_files,
+                    cleaned.removed_files
+                ),
+                (0, 0, 0)
+            );
+        }
+        cfg.path = "moved/{take.year}".into();
+        cfg.filename = "renamed".into();
+        let dry = crate::consolidate::run(&cfg, &state, &|_| {}, true).unwrap();
+        assert_eq!(dry.moved, 1);
+        assert!(versions.iter().all(|(p, _)| Path::new(p).is_file()));
+        let moved = crate::consolidate::run(&cfg, &state, &|_| {}, false).unwrap();
+        assert_eq!(moved.moved, 1);
+        let dir = cfg.export_dir.join("moved/2001");
+        for (old, bytes) in &versions {
+            let name = Path::new(old)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replacen("IMG_1", "renamed", 1);
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+            assert!(!Path::new(old).exists());
+        }
+        assert!(dir.join("renamed.xmp").is_file());
+        assert_eq!(
+            state.exported("B", Kind::Original).unwrap().unwrap(),
+            dir.join("renamed.jpg").to_string_lossy()
+        );
+        assert_eq!(
+            state.duplicate(&hash).unwrap(),
+            state.exported("B", Kind::Original).unwrap()
+        );
+        let latest = state.exported("A", Kind::Original).unwrap().unwrap();
+        std::fs::remove_file(dir.join("renamed.jpg")).unwrap();
+        let cleaned = crate::clean::run(&cfg, &state, true, &|_| {}, false).unwrap();
+        assert_eq!(
+            (
+                cleaned.dead_rows,
+                cleaned.removed_files,
+                cleaned.removed_sidecars
+            ),
+            (2, 0, 0)
+        );
+        assert_eq!(
+            state.exported("A", Kind::Original).unwrap().as_deref(),
+            Some(latest.as_str())
+        );
+        assert_eq!(state.paths_of("A").unwrap().len(), 2);
+        std::fs::remove_file(&latest).unwrap();
+        let cleaned = crate::clean::run(&cfg, &state, true, &|_| {}, false).unwrap();
+        assert_eq!(
+            (
+                cleaned.dead_rows,
+                cleaned.removed_assets,
+                cleaned.removed_sidecars
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(state.paths_of("A").unwrap().len(), 1);
+        assert!(dir.join("renamed.xmp").is_file());
+        let repaired = run_revision(&src, &cfg, &state, "3", false);
+        assert_eq!((repaired.exported, repaired.errors), (1, 0));
+        assert_eq!(state.paths_of("A").unwrap().len(), 2);
     }
 
     #[test]

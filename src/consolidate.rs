@@ -80,7 +80,7 @@ fn relocate(
 ) -> Result<()> {
     let new_dir_s = new_dir.to_string_lossy().into_owned();
     let mut paths = Vec::new();
-    for (kind, path) in state.exports_of(uuid)? {
+    for path in state.paths_of(uuid)? {
         let p = Path::new(&path);
         if !p.starts_with(dir) {
             continue;
@@ -90,7 +90,7 @@ fn relocate(
         if p.exists() {
             move_file(p, &dest)?;
         }
-        paths.push((kind, dest.to_string_lossy().into_owned()));
+        paths.push((path, dest.to_string_lossy().into_owned()));
     }
     let sidecar = dir.join(format!("{stem}.xmp"));
     if sidecar.exists() {

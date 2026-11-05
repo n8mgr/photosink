@@ -117,7 +117,7 @@ pub fn run(
     for row in dead {
         out.dead_rows += 1;
         if !dry {
-            state.forget_export(&row.uuid, row.kind)?;
+            state.forget_export(&row.uuid, row.kind, &row.path)?;
         }
         progress(Event::Clean {
             path: rel(cfg, Path::new(&row.path)),
