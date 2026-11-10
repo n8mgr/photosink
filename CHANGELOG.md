@@ -1,4 +1,29 @@
 # Changelog
+## 0.1.2 (2026-11-10)
+
+### Features
+
+#### Export automatically in the background
+
+Enable automatic exports directly on each configured source and choose the check
+interval in Settings. OneDrive and Dropbox reuse saved credentials, and
+changed media exports preserve earlier versions.
+Existing exports are used as the starting point for change tracking without downloading
+them again.
+
+Photosink can continue exporting after its window closes and optionally start at login.
+
+### Fixes
+
+#### Keep earlier exports tracked during maintenance
+
+Earlier versions remain recorded so Clean preserves them and Consolidate moves
+them with their asset. Exports also recreate deleted destination folders and
+handle duplicate detection safely when revisions export concurrently.
+Consolidate handles overlapping revision filenames, and Dates and Consolidate
+can use metadata from earlier versions when the latest export is missing.
+Failed destination creation no longer reserves an unusable export location.
+
 ## 0.1.1 (2026-11-04)
 
 ### Features
