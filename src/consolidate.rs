@@ -80,23 +80,64 @@ fn relocate(
 ) -> Result<()> {
     let new_dir_s = new_dir.to_string_lossy().into_owned();
     let mut paths = Vec::new();
-    for (kind, path) in state.exports_of(uuid)? {
+    let mut files = Vec::new();
+    for path in state.paths_of(uuid)? {
         let p = Path::new(&path);
         if !p.starts_with(dir) {
             continue;
         }
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let dest = new_dir.join(restem(name, stem, new_stem));
-        if p.exists() {
-            move_file(p, &dest)?;
+        if p != dest && p.exists() {
+            files.push((p.to_path_buf(), dest.clone()));
         }
-        paths.push((kind, dest.to_string_lossy().into_owned()));
+        paths.push((path, dest.to_string_lossy().into_owned()));
     }
     let sidecar = dir.join(format!("{stem}.xmp"));
-    if sidecar.exists() {
-        move_file(&sidecar, &new_dir.join(format!("{new_stem}.xmp")))?;
+    let new_sidecar = new_dir.join(format!("{new_stem}.xmp"));
+    if sidecar != new_sidecar && sidecar.exists() {
+        files.push((sidecar, new_sidecar));
     }
-    state.relocate(uuid, &new_dir_s, new_stem, &paths)?;
+    for (_, to) in &files {
+        anyhow::ensure!(
+            !to.exists() || files.iter().any(|(from, _)| from == to),
+            "{} exists",
+            to.display()
+        );
+    }
+    let staging = tempfile::tempdir_in(dir)?;
+    let mut staged = 0;
+    let mut published = 0;
+    let result = (|| {
+        for (i, (from, _)) in files.iter().enumerate() {
+            move_file(from, &staging.path().join(i.to_string()))?;
+            staged += 1;
+        }
+        for (i, (_, to)) in files.iter().enumerate() {
+            move_file(&staging.path().join(i.to_string()), to)?;
+            published += 1;
+        }
+        state.relocate(uuid, &new_dir_s, new_stem, &paths)
+    })();
+    if let Err(error) = result {
+        let rollback = (|| -> Result<()> {
+            for (i, (_, to)) in files.iter().enumerate().take(published) {
+                move_file(to, &staging.path().join(i.to_string()))?;
+            }
+            for (i, (from, _)) in files.iter().enumerate().take(staged) {
+                move_file(&staging.path().join(i.to_string()), from)?;
+            }
+            Ok(())
+        })();
+        if let Err(rollback) = rollback {
+            let saved = staging.keep();
+            return Err(error.context(format!(
+                "rollback failed: {rollback:#}; staged files kept in {}",
+                saved.display()
+            )));
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -238,6 +279,88 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn overlapping_revision_paths_move_once() {
+        for missing_middle in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("out");
+            let state = State::open(&root.path().join("state.sqlite")).unwrap();
+            let names = ["IMG_1.jpg", "IMG_1_A.jpg", "IMG_1_A_hash.jpg"];
+            seed(
+                &state,
+                &dir,
+                "A",
+                "IMG_1",
+                &names,
+                &asset("A", "IMG_1.jpg", "", ""),
+            );
+            state
+                .record(
+                    "B",
+                    crate::sources::Kind::Original,
+                    "shared",
+                    &dir.join(names[0]).to_string_lossy(),
+                )
+                .unwrap();
+            if missing_middle {
+                std::fs::remove_file(dir.join(names[1])).unwrap();
+            }
+            relocate(&state, "A", &dir, "IMG_1", &dir, "IMG_1_A").unwrap();
+            for (i, name) in names.iter().enumerate() {
+                let dest = dir.join(restem(name, "IMG_1", "IMG_1_A"));
+                assert!(
+                    state
+                        .paths_of("A")
+                        .unwrap()
+                        .contains(&dest.to_string_lossy().into_owned())
+                );
+                if i == 1 && missing_middle {
+                    assert!(!dest.exists());
+                } else {
+                    assert_eq!(std::fs::read_to_string(dest).unwrap(), *name);
+                }
+            }
+            assert_eq!(
+                state
+                    .exported("B", crate::sources::Kind::Original)
+                    .unwrap()
+                    .unwrap(),
+                dir.join("IMG_1_A.jpg").to_string_lossy()
+            );
+            assert_eq!(state.paths_of("A").unwrap().len(), 3);
+            assert!(dir.join("IMG_1_A.xmp").exists());
+            assert!(!dir.join("IMG_1.jpg").exists());
+        }
+    }
+
+    #[test]
+    fn failed_relocation_restores_overlapping_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("out");
+        let state = State::open(&root.path().join("state.sqlite")).unwrap();
+        let names = ["IMG_1.jpg", "IMG_1_A.jpg", "IMG_1_A_hash.jpg"];
+        seed(
+            &state,
+            &dir,
+            "A",
+            "IMG_1",
+            &names,
+            &asset("A", "IMG_1.jpg", "", ""),
+        );
+        state
+            .claim_stem("B", &dir.to_string_lossy(), "IMG_1_A")
+            .unwrap();
+        let paths = state.paths_of("A").unwrap();
+        assert!(relocate(&state, "A", &dir, "IMG_1", &dir, "IMG_1_A").is_err());
+        for name in names {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), name);
+        }
+        assert_eq!(state.paths_of("A").unwrap(), paths);
+        assert_eq!(state.stem("A").unwrap().as_deref(), Some("IMG_1"));
+        assert!(dir.join("IMG_1.xmp").exists());
+        assert!(!dir.join("IMG_1_A.xmp").exists());
     }
 
     #[test]

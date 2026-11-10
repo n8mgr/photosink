@@ -16,6 +16,7 @@ pub struct RunArgs {
     pub arg: String,
     pub dry: bool,
     pub option: bool,
+    pub automatic: bool,
 }
 
 /// A run that needs the user's go-ahead first.
@@ -60,6 +61,13 @@ pub enum RunTitle {
 }
 
 impl Tab {
+    pub(crate) fn is_source(self) -> bool {
+        matches!(
+            self,
+            Self::ApplePhotos | Self::OneDrive | Self::Dropbox | Self::GoogleTakeout
+        )
+    }
+
     /// The run log's file name prefix.
     pub(crate) fn slug(self) -> &'static str {
         match self {
@@ -85,6 +93,7 @@ impl Tab {
             },
             dry: false,
             option: false,
+            automatic: false,
         }
     }
 

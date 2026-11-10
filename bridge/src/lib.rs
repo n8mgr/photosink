@@ -2,22 +2,25 @@
 //! `Core` returns, forwards edits back, and re-reads whatever `Listener`
 //! reports changed.
 
+mod automatic;
 pub mod catalog;
 pub mod dates;
 pub mod grid;
 pub mod settings;
 
+use automatic::Schedule;
 use catalog::{Blocker, Confirmation, RunArgs, RunTitle, Tab};
 use dates::{DateKey, DateRow, Dates, DatesView};
 use grid::{Chip, Grid, Row, RowState};
 use photosink::photo::Asset;
 use photosink::redate::Choice;
+use photosink::sources::AuthMode;
 use photosink::{App, Event, config};
 use settings::{Field, Preview, Settings, SettingsProblem};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 uniffi::setup_scaffolding!();
 
@@ -125,6 +128,8 @@ struct Model {
     status: Status,
     running: Option<Tab>,
     settings: Option<Settings>,
+    args_loaded: bool,
+    schedule: Schedule,
     dropbox_key: bool,
     /// The asset templates are previewed against, for the export folder it was read from.
     sample: Option<(String, Option<(Asset, String)>)>,
@@ -132,6 +137,7 @@ struct Model {
 
 enum Job {
     Run,
+    Automatic,
     ApplyDates(Vec<Choice>),
 }
 
@@ -139,6 +145,8 @@ struct Shared {
     model: Mutex<Model>,
     dirty: Mutex<HashSet<Change>>,
     listener: Arc<dyn Listener>,
+    config_path: Option<PathBuf>,
+    config_lock: Mutex<()>,
 }
 
 #[derive(uniffi::Object)]
@@ -184,6 +192,65 @@ impl Shared {
         self.mark(Change::Status);
     }
 
+    fn configure_schedule(m: &mut Model) {
+        if let Some(settings) = &m.settings {
+            m.schedule.configure(settings, &m.args, Instant::now());
+        }
+    }
+
+    fn blocker(&self, m: &Model, tab: Tab, args: &RunArgs) -> Option<Blocker> {
+        if let Some(tab) = m.running {
+            return Some(Blocker::Running { tab });
+        }
+        let export_dir = m.settings.as_ref().map_or("", |s| s.export_dir.as_str());
+        if let Some(blocker) = tab.blocker(args, export_dir) {
+            return Some(blocker);
+        }
+        if tab == Tab::Dropbox && !m.dropbox_key {
+            return Some(Blocker::DropboxKeyMissing {
+                config_path: self
+                    .config_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(photosink::config_path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            });
+        }
+        None
+    }
+
+    fn begin_run(&self, m: &mut Model, tab: Tab, args: &RunArgs) {
+        let template = m.settings.as_ref().map_or("", |s| s.path.as_str());
+        m.stats.remove(&tab);
+        let grid = m.grids.entry(tab).or_default();
+        grid.clear();
+        grid.start_run(tab.run_title(args, template));
+        if tab == Tab::Dates {
+            m.dates.start_scan(!args.arg.trim().is_empty());
+            self.mark(Change::Dates);
+        }
+        self.set_status(m, Status::Running { tab });
+        self.mark(Change::Grid { tab });
+    }
+
+    fn scheduled_run(&self, now: Instant) -> Option<(Tab, RunArgs)> {
+        let mut m = lock(&self.model);
+        if m.running.is_some() {
+            return None;
+        }
+        let tab = m.schedule.ready(now)?;
+        let mut args = m.args.get(&tab)?.clone();
+        args.dry = false;
+        args.option = false;
+        if self.blocker(&m, tab, &args).is_some() {
+            m.schedule.finished(tab, now);
+            return None;
+        }
+        self.begin_run(&mut m, tab, &args);
+        Some((tab, args))
+    }
+
     /// Routes one event from a run on `tab` into the model.
     fn event(&self, tab: Tab, e: Event) {
         let mut m = lock(&self.model);
@@ -209,13 +276,24 @@ impl Shared {
 
     fn run(self: &Arc<Self>, tab: Tab, args: RunArgs, job: Job) {
         let applying = matches!(job, Job::ApplyDates(_));
+        let auth = if matches!(job, Job::Automatic) {
+            AuthMode::Unattended
+        } else {
+            AuthMode::Interactive
+        };
         let app = match App::open() {
             Ok(app) => app,
-            Err(e) => return self.finish(tab, Err(e), applying),
+            Err(e) => {
+                self.finish(tab, Err(e), applying);
+                return;
+            }
         };
         let log = match app.run_log(if applying { "dates-apply" } else { tab.slug() }) {
             Ok(log) => log,
-            Err(e) => return self.finish(tab, Err(e), applying),
+            Err(e) => {
+                self.finish(tab, Err(e), applying);
+                return;
+            }
         };
         let first = Event::Log {
             path: log.path.display().to_string(),
@@ -231,18 +309,18 @@ impl Shared {
             Job::ApplyDates(choices) => app
                 .redate_apply(&choices, &progress)
                 .map(|c| consolidated(&c, false)),
-            Job::Run => match tab {
+            Job::Run | Job::Automatic => match tab {
                 #[cfg(target_os = "macos")]
                 Tab::ApplePhotos => app
-                    .apple_photos(Path::new(&args.arg), &progress, dry)
+                    .apple_photos_with_auth(Path::new(&args.arg), &progress, dry, auth)
                     .map(|s| summary(&s, dry)),
                 #[cfg(not(target_os = "macos"))]
                 Tab::ApplePhotos => unreachable!("start() returns Blocker::Unavailable"),
                 Tab::OneDrive => app
-                    .onedrive(args.arg.trim(), &progress, dry)
+                    .onedrive_with_auth(args.arg.trim(), &progress, dry, auth)
                     .map(|s| summary(&s, dry)),
                 Tab::Dropbox => app
-                    .dropbox(args.arg.trim(), &progress, dry)
+                    .dropbox_with_auth(args.arg.trim(), &progress, dry, auth)
                     .map(|s| summary(&s, dry)),
                 Tab::GoogleTakeout => app
                     .takeout(Path::new(args.arg.trim()), &progress, dry)
@@ -284,22 +362,16 @@ impl Shared {
                 }
             },
         };
-        self.finish(tab, result, applying);
-        if applying {
-            let failed = lock(&self.model)
-                .grids
-                .get(&Tab::Dates)
-                .map_or(0, Grid::errors)
-                > 0;
-            if !failed {
-                self.rescan(args);
-            }
+        if self.finish(tab, result, applying) {
+            self.rescan(args);
         }
     }
 
     /// Ends a run on `tab`; `applied` when it applied dates rather than scanning.
-    fn finish(&self, tab: Tab, result: anyhow::Result<Vec<Stat>>, applied: bool) {
+    fn finish(&self, tab: Tab, result: anyhow::Result<Vec<Stat>>, applied: bool) -> bool {
         let mut m = lock(&self.model);
+        let rescan = applied && result.is_ok() && m.grids.get(&tab).map_or(0, Grid::errors) == 0;
+        m.schedule.finished(tab, Instant::now());
         m.sample = None;
         if tab == Tab::Dates {
             m.dates.finish();
@@ -311,7 +383,14 @@ impl Shared {
                     m.stats.insert(tab, stats);
                 }
                 let errors = m.grids.get(&tab).map_or(0, Grid::errors) as u32;
-                self.set_status(&mut m, Status::Done { errors });
+                self.set_status(
+                    &mut m,
+                    if rescan {
+                        Status::CheckingDates
+                    } else {
+                        Status::Done { errors }
+                    },
+                );
             }
             Err(e) => {
                 m.grids.entry(tab).or_default().push_error(format!("{e:#}"));
@@ -319,6 +398,7 @@ impl Shared {
             }
         }
         self.mark(Change::Grid { tab });
+        rescan
     }
 
     fn rescan(self: &Arc<Self>, args: RunArgs) {
@@ -340,6 +420,10 @@ impl Shared {
             loop {
                 std::thread::sleep(TICK);
                 let Some(shared) = weak.upgrade() else { return };
+                if let Some((tab, args)) = shared.scheduled_run(Instant::now()) {
+                    let worker = shared.clone();
+                    std::thread::spawn(move || worker.run(tab, args, Job::Automatic));
+                }
                 let changes: Vec<Change> = lock(&shared.dirty).drain().collect();
                 for c in changes {
                     shared.listener.changed(c);
@@ -383,6 +467,50 @@ fn consolidated(c: &photosink::consolidate::Consolidated, dry: bool) -> Vec<Stat
 }
 
 impl Core {
+    fn create(
+        listener: Arc<dyn Listener>,
+        config_path: Option<PathBuf>,
+        ticker: bool,
+    ) -> Arc<Core> {
+        let shared = Arc::new(Shared {
+            model: Mutex::new(Model {
+                grids: HashMap::new(),
+                stats: HashMap::new(),
+                args: catalog::tabs()
+                    .into_iter()
+                    .map(|t| (t, t.default_args()))
+                    .collect(),
+                dates: Dates::default(),
+                status: Status::Idle,
+                running: None,
+                settings: None,
+                args_loaded: false,
+                schedule: Schedule::default(),
+                dropbox_key: false,
+                sample: None,
+            }),
+            dirty: Mutex::new(HashSet::new()),
+            listener,
+            config_path,
+            config_lock: Mutex::new(()),
+        });
+        if ticker {
+            Shared::spawn_ticker(&shared);
+        }
+        Arc::new(Core { shared })
+    }
+
+    fn config_file(&self) -> anyhow::Result<PathBuf> {
+        if let Some(path) = &self.shared.config_path {
+            if !path.exists() {
+                config::write_initial(path)?;
+            }
+            Ok(path.clone())
+        } else {
+            config_file()
+        }
+    }
+
     fn model(&self) -> MutexGuard<'_, Model> {
         lock(&self.shared.model)
     }
@@ -418,26 +546,7 @@ impl Core {
 impl Core {
     #[uniffi::constructor]
     pub fn new(listener: Arc<dyn Listener>) -> Arc<Core> {
-        let shared = Arc::new(Shared {
-            model: Mutex::new(Model {
-                grids: HashMap::new(),
-                stats: HashMap::new(),
-                args: catalog::tabs()
-                    .into_iter()
-                    .map(|t| (t, t.default_args()))
-                    .collect(),
-                dates: Dates::default(),
-                status: Status::Idle,
-                running: None,
-                settings: None,
-                dropbox_key: false,
-                sample: None,
-            }),
-            dirty: Mutex::new(HashSet::new()),
-            listener,
-        });
-        Shared::spawn_ticker(&shared);
-        Arc::new(Core { shared })
+        Self::create(listener, None, true)
     }
 
     /// Every tab available on this platform, in sidebar order.
@@ -451,19 +560,39 @@ impl Core {
     }
 
     pub fn settings(&self) -> Result<Settings, CoreError> {
-        let cfg = config::Config::load(&config_file()?)?;
+        let _config = lock(&self.shared.config_lock);
+        let cfg = config::Config::load(&self.config_file()?)?;
         let s = Settings::from_config(&cfg);
         let mut m = self.model();
+        if !m.args_loaded {
+            for (tab, args) in &mut m.args {
+                if let Some(source) = cfg.sources.get(tab.slug()) {
+                    args.arg = source.arg.clone();
+                    args.automatic = source.automatic;
+                }
+            }
+            m.args_loaded = true;
+        }
         m.settings = Some(s.clone());
         m.dropbox_key = !cfg.dropbox_app_key.trim().is_empty();
+        Shared::configure_schedule(&mut m);
         Ok(s)
     }
 
     /// Saves `settings`; on error nothing is written and the reason is returned.
     pub fn save_settings(&self, settings: Settings) -> Result<(), CoreError> {
-        settings.save(&config_file()?)?;
-        self.model().settings = Some(settings);
+        drop(self.loaded());
+        let _config = lock(&self.shared.config_lock);
+        let mut m = self.model();
+        settings.save(&self.config_file()?)?;
+        m.settings = Some(settings);
+        Shared::configure_schedule(&mut m);
+        self.shared.mark(Change::Status);
         Ok(())
+    }
+
+    pub fn automatic_enabled(&self) -> bool {
+        self.model().schedule.enabled()
     }
 
     /// Renders both templates of `settings` against the first asset exported
@@ -474,37 +603,49 @@ impl Core {
     }
 
     pub fn run_args(&self, tab: Tab) -> RunArgs {
-        self.model()
+        self.loaded()
             .args
             .get(&tab)
             .cloned()
             .unwrap_or_else(|| tab.default_args())
     }
 
-    pub fn set_run_args(&self, tab: Tab, args: RunArgs) {
-        self.model().args.insert(tab, args);
+    pub fn set_run_args(&self, tab: Tab, mut args: RunArgs) -> Result<(), CoreError> {
+        drop(self.loaded());
+        let _config = lock(&self.shared.config_lock);
+        let mut m = self.model();
+        if tab.is_source() {
+            let source = toml::Value::try_from(config::SourceSettings {
+                arg: args.arg.clone(),
+                automatic: args.automatic,
+            })
+            .map_err(anyhow::Error::from)?;
+            config::update(&self.config_file()?, |t| {
+                let sources = t
+                    .entry("sources")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let Some(sources) = sources.as_table_mut() {
+                    sources.insert(tab.slug().into(), source);
+                }
+            })?;
+        } else {
+            args.automatic = false;
+        }
+        let changed_path = m.args.get(&tab).is_some_and(|old| old.arg != args.arg);
+        m.args.insert(tab, args);
+        Shared::configure_schedule(&mut m);
+        if changed_path {
+            m.schedule.finished(tab, Instant::now());
+        }
         self.shared.mark(Change::Status);
+        Ok(())
     }
 
     /// Why `tab` can't run yet, or None when it can.
     pub fn blocker(&self, tab: Tab) -> Option<Blocker> {
         let args = self.run_args(tab);
         let m = self.loaded();
-        if let Some(running) = m.running {
-            return Some(Blocker::Running { tab: running });
-        }
-        let export_dir = m.settings.as_ref().map_or("", |s| s.export_dir.as_str());
-        if let Some(why) = tab.blocker(&args, export_dir) {
-            return Some(why);
-        }
-        if tab == Tab::Dropbox && !m.dropbox_key {
-            return Some(Blocker::DropboxKeyMissing {
-                config_path: photosink::config_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            });
-        }
-        None
+        self.shared.blocker(&m, tab, &args)
     }
 
     /// Ask this before `start` when it returns something.
@@ -514,29 +655,20 @@ impl Core {
 
     /// Starts a run on `tab` with its stored args, replacing the tab's rows.
     pub fn start(&self, tab: Tab) -> Result<(), CoreError> {
-        if let Some(blocker) = self.blocker(tab) {
-            return Err(CoreError::Blocked { blocker });
-        }
-        let args = self.run_args(tab);
-        let template = self
-            .model()
-            .settings
-            .as_ref()
-            .map(|s| s.path.clone())
-            .unwrap_or_default();
-        {
+        drop(self.loaded());
+        let args = {
             let mut m = self.model();
-            m.stats.remove(&tab);
-            let grid = m.grids.entry(tab).or_default();
-            grid.clear();
-            grid.start_run(tab.run_title(&args, &template));
-            if tab == Tab::Dates {
-                m.dates.start_scan(!args.arg.trim().is_empty());
-                self.shared.mark(Change::Dates);
+            let args = m
+                .args
+                .get(&tab)
+                .cloned()
+                .unwrap_or_else(|| tab.default_args());
+            if let Some(blocker) = self.shared.blocker(&m, tab, &args) {
+                return Err(CoreError::Blocked { blocker });
             }
-            self.shared.set_status(&mut m, Status::Running { tab });
-            self.shared.mark(Change::Grid { tab });
-        }
+            self.shared.begin_run(&mut m, tab, &args);
+            args
+        };
         let shared = self.shared.clone();
         std::thread::spawn(move || shared.run(tab, args, Job::Run));
         Ok(())
@@ -544,12 +676,12 @@ impl Core {
 
     /// Applies the chosen dates, then scans again unless something failed.
     pub fn apply_dates(&self) -> Result<(), CoreError> {
-        if let Some(tab) = self.model().running {
-            return Err(CoreError::Running { tab });
-        }
         let args = self.run_args(Tab::Dates);
         let choices = {
             let mut m = self.model();
+            if let Some(tab) = m.running {
+                return Err(CoreError::Running { tab });
+            }
             let choices = m.dates.take_choices();
             if choices.is_empty() {
                 return Err(CoreError::NothingChosen);
@@ -575,7 +707,7 @@ impl Core {
         self.model().status.clone()
     }
 
-    /// The tab a run is going on, if any; tabs can't be switched meanwhile.
+    /// The tab with an active operation, if any.
     pub fn running(&self) -> Option<Tab> {
         self.model().running
     }
@@ -674,6 +806,179 @@ mod tests {
         fn changed(&self, change: Change) {
             lock(&self.0).push(change);
         }
+    }
+
+    fn isolated_core(path: &Path) -> Arc<Core> {
+        Core::create(
+            Arc::new(Recorder(Mutex::new(Vec::new()))),
+            Some(path.to_owned()),
+            false,
+        )
+    }
+
+    #[test]
+    fn persists_source_selection_but_not_dry_run_or_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "export_dir = '/out'\n").unwrap();
+        let core = isolated_core(&path);
+        core.set_run_args(
+            Tab::OneDrive,
+            RunArgs {
+                arg: "Pictures/Trips".into(),
+                automatic: true,
+                dry: true,
+                option: true,
+            },
+        )
+        .unwrap();
+        core.set_run_args(
+            Tab::Clean,
+            RunArgs {
+                automatic: true,
+                ..RunArgs::default()
+            },
+        )
+        .unwrap();
+        assert!(!core.run_args(Tab::Clean).automatic);
+        assert!(core.automatic_enabled());
+        let reopened = isolated_core(&path);
+        let args = reopened.run_args(Tab::OneDrive);
+        assert_eq!(args.arg, "Pictures/Trips");
+        assert!(args.automatic);
+        assert!(!args.dry && !args.option);
+        assert!(reopened.automatic_enabled());
+        assert_eq!(config::Config::load(&path).unwrap().sources.len(), 1);
+    }
+
+    #[test]
+    fn automatic_runs_reserve_the_same_slot_as_manual_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "export_dir = '/out'\n[sources.onedrive]\nautomatic = true\n",
+        )
+        .unwrap();
+        let core = isolated_core(&path);
+        let mut args = core.run_args(Tab::OneDrive);
+        args.dry = true;
+        core.set_run_args(Tab::OneDrive, args).unwrap();
+        let now = Instant::now();
+        let (tab, args) = core.shared.scheduled_run(now).unwrap();
+        assert_eq!(tab, Tab::OneDrive);
+        assert!(!args.dry);
+        assert!(core.shared.scheduled_run(now).is_none());
+        assert!(matches!(
+            core.start(Tab::Consolidate),
+            Err(CoreError::Blocked {
+                blocker: Blocker::Running { tab: Tab::OneDrive }
+            })
+        ));
+        assert!(matches!(
+            core.apply_dates(),
+            Err(CoreError::Running { tab: Tab::OneDrive })
+        ));
+        core.shared
+            .finish(tab, Err(anyhow::anyhow!("offline")), false);
+        assert!(core.shared.scheduled_run(Instant::now()).is_none());
+        assert!(
+            core.shared
+                .scheduled_run(Instant::now() + Duration::from_secs(901))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn manual_run_and_date_rescan_keep_automatic_work_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "export_dir = '/out'\n[sources.onedrive]\nautomatic = true\n",
+        )
+        .unwrap();
+        let core = isolated_core(&path);
+        core.settings().unwrap();
+        {
+            let mut m = core.model();
+            core.shared.set_status(&mut m, Status::ApplyingDates);
+        }
+        assert!(core.shared.scheduled_run(Instant::now()).is_none());
+        assert!(core.shared.finish(Tab::Dates, Ok(Vec::new()), true));
+        assert_eq!(core.status(), Status::CheckingDates);
+        assert!(core.shared.scheduled_run(Instant::now()).is_none());
+        core.shared.finish(Tab::Dates, Ok(Vec::new()), false);
+        assert_eq!(
+            core.shared.scheduled_run(Instant::now()).unwrap().0,
+            Tab::OneDrive
+        );
+    }
+
+    #[test]
+    fn source_toggles_control_automatic_checks_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "export_dir = '/out'\nautomatic = false\n[sources.onedrive]\narg = 'Pictures'\nautomatic = true\n[sources.dropbox]\nautomatic = true\n",
+        )
+        .unwrap();
+        let core = isolated_core(&path);
+        core.settings().unwrap();
+        assert!(core.automatic_enabled());
+        let mut args = core.run_args(Tab::OneDrive);
+        args.automatic = false;
+        core.set_run_args(Tab::OneDrive, args).unwrap();
+        assert!(core.automatic_enabled());
+        assert_eq!(
+            core.model().schedule.ready(Instant::now()),
+            Some(Tab::Dropbox)
+        );
+        assert_eq!(core.run_args(Tab::OneDrive).arg, "Pictures");
+        let mut args = core.run_args(Tab::Dropbox);
+        args.automatic = false;
+        core.set_run_args(Tab::Dropbox, args).unwrap();
+        assert!(!core.automatic_enabled());
+        assert!(
+            core.shared
+                .scheduled_run(Instant::now() + Duration::from_secs(3600))
+                .is_none()
+        );
+        let saved: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(!saved.contains_key("automatic"));
+        let reopened = isolated_core(&path);
+        assert!(!reopened.run_args(Tab::OneDrive).automatic);
+        assert!(!reopened.run_args(Tab::Dropbox).automatic);
+        assert!(!reopened.automatic_enabled());
+    }
+
+    #[test]
+    fn editing_a_watched_path_defers_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "export_dir = '/out'\n[sources.onedrive]\nautomatic = true\n",
+        )
+        .unwrap();
+        let core = isolated_core(&path);
+        let mut args = core.run_args(Tab::OneDrive);
+        args.arg = "Pictures/".into();
+        core.set_run_args(Tab::OneDrive, args.clone()).unwrap();
+        assert!(core.shared.scheduled_run(Instant::now()).is_none());
+        args.arg.push_str("Trips");
+        core.set_run_args(Tab::OneDrive, args).unwrap();
+        assert!(
+            core.shared
+                .scheduled_run(Instant::now() + Duration::from_secs(899))
+                .is_none()
+        );
+        let (_, args) = core
+            .shared
+            .scheduled_run(Instant::now() + Duration::from_secs(901))
+            .unwrap();
+        assert_eq!(args.arg, "Pictures/Trips");
     }
 
     #[test]

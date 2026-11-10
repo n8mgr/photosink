@@ -1,5 +1,5 @@
-use super::Source;
 use super::oauth::{Provider, Session, Token, now};
+use super::{AuthMode, Source};
 use crate::Progress;
 use crate::photo::{Asset, Camera};
 use anyhow::{Context, Result, bail};
@@ -13,8 +13,7 @@ use std::time::Duration;
 const AUTH: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
 const GRAPH: &str = "https://graph.microsoft.com/v1.0/me/drive";
 const SCOPE: &str = "Files.Read offline_access";
-const SELECT: &str =
-    "$select=id,name,file,folder,deleted,photo,location,description,fileSystemInfo,createdDateTime";
+const SELECT: &str = "$select=id,name,file,folder,deleted,photo,location,description,fileSystemInfo,createdDateTime,cTag,eTag";
 
 struct Microsoft {
     client_id: String,
@@ -70,6 +69,7 @@ fn item_asset(v: &Value) -> Option<Asset> {
     let photo = &v["photo"];
     let mut a = Asset {
         uuid: v["id"].as_str()?.to_owned(),
+        revision: text(&v["cTag"]).or_else(|| text(&v["eTag"])),
         filename: v["name"].as_str()?.to_owned(),
         description: text(&v["description"]),
         taken: DateTime::parse_from_rfc3339(photo["takenDateTime"].as_str().unwrap_or("")).ok(),
@@ -142,12 +142,13 @@ impl OneDrive {
         client_id: &str,
         token_path: &Path,
         progress: Progress,
+        auth: AuthMode,
     ) -> Result<OneDrive> {
         let provider = Microsoft {
             client_id: client_id.to_owned(),
         };
         Ok(OneDrive {
-            session: Session::connect(provider, token_path, progress)?,
+            session: Session::connect(provider, token_path, progress, auth)?,
         })
     }
 
@@ -206,12 +207,14 @@ mod tests {
     fn maps_items() {
         let a = item_asset(&json!({
             "id": "X1", "name": "IMG_1.HEIC", "description": "d",
+            "cTag": "content-1", "eTag": "metadata-2",
             "file": {"mimeType": "image/heic"},
             "photo": {"takenDateTime": "2019-05-03T18:27:59Z", "cameraMake": "Apple", "cameraModel": "iPhone"},
             "location": {"latitude": 48.8566, "longitude": 2.3522}
         }))
         .unwrap();
         assert_eq!((a.uuid.as_str(), a.filename.as_str()), ("X1", "IMG_1.HEIC"));
+        assert_eq!(a.revision.as_deref(), Some("content-1"));
         assert_eq!(
             a.taken.unwrap().format("%Y-%m-%d").to_string(),
             "2019-05-03"
@@ -220,8 +223,9 @@ mod tests {
         assert_eq!(a.place.country.as_deref(), Some("FR"));
         assert!(!a.video);
 
-        let v = item_asset(&json!({"id": "V", "name": "a.mp4", "file": {"mimeType": "video/mp4"}}))
+        let v = item_asset(&json!({"id": "V", "name": "a.mp4", "eTag": "version-1", "file": {"mimeType": "video/mp4"}}))
             .unwrap();
+        assert_eq!(v.revision.as_deref(), Some("version-1"));
         assert!(v.video && v.taken.is_none());
         assert!(item_asset(&json!({"id": "F", "name": "f", "folder": {}})).is_none());
         assert!(item_asset(&json!({"id": "D", "name": "a.jpg", "file": {"mimeType": "image/jpeg"}, "deleted": {}})).is_none());

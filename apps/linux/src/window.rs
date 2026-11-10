@@ -84,10 +84,6 @@ impl Window {
 
     fn status(&self) {
         let st = self.core.status();
-        let running = self.core.running();
-        for (tab, row) in &self.rows {
-            row.set_sensitive(running.is_none_or(|t| t == *tab));
-        }
         for page in self.pages.values() {
             page.refresh_run();
             page.view.refresh_clear();
@@ -175,6 +171,7 @@ impl Window {
         let menu = gio::Menu::new();
         menu.append(Some("_Preferences"), Some("app.preferences"));
         menu.append(Some("_About photosink"), Some("app.about"));
+        menu.append(Some("_Quit"), Some("app.quit"));
         let menu_button = gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
             .menu_model(&menu)
@@ -250,6 +247,18 @@ impl Window {
             last_status: RefCell::new(None),
         });
 
+        let weak = Rc::downgrade(&win);
+        win.window.connect_close_request(move |_| {
+            let Some(win) = weak.upgrade() else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            if win.settings.keep_running_after_close() {
+                win.window.set_visible(false);
+                gtk::glib::Propagation::Stop
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
         let weak = Rc::downgrade(&win);
         win.sidebar.connect_row_selected(move |_, row| {
             let (Some(win), Some(row)) = (weak.upgrade(), row) else {

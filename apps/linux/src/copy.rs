@@ -559,6 +559,9 @@ pub fn settings_problem(p: &SettingsProblem) -> String {
             format!("{what} uses unknown {noun} {}", names.join(", "))
         }
         SettingsProblem::FromAfterTo => "filter.from is after filter.to".to_owned(),
+        SettingsProblem::CheckInterval { .. } => {
+            "Check interval must be between 1 and 1440 minutes.".to_owned()
+        }
     }
 }
 

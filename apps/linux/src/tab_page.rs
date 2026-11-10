@@ -41,7 +41,9 @@ impl TabPage {
     fn update_args(&self, f: impl FnOnce(&mut RunArgs)) {
         let mut args = self.core.run_args(self.tab);
         f(&mut args);
-        self.core.set_run_args(self.tab, args);
+        if let Err(e) = self.core.set_run_args(self.tab, args) {
+            self.toaster.show(copy::error(self.tab, &e));
+        }
         self.refresh_run();
     }
 
@@ -217,6 +219,17 @@ impl TabPage {
                 self.add_dry_run(group);
             }
             Tab::Dates => self.connect_arg(group, true),
+        }
+        if matches!(
+            self.tab,
+            Tab::ApplePhotos | Tab::OneDrive | Tab::Dropbox | Tab::GoogleTakeout
+        ) {
+            self.add_switch(
+                group,
+                "Export automatically",
+                self.core.run_args(self.tab).automatic,
+                |a, on| a.automatic = on,
+            );
         }
         let weak = Rc::downgrade(self);
         self.run.connect_clicked(move |_| {

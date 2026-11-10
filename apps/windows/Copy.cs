@@ -249,6 +249,7 @@ internal static class Copy
         SettingsProblem.UnknownFields p =>
             $"{(p.Template == TemplateKind.Folder ? "path" : "filename")} uses unknown field{(p.Names.Length == 1 ? "" : "s")} {string.Join(", ", p.Names)}",
         SettingsProblem.FromAfterTo => "filter.from is after filter.to",
+        SettingsProblem.CheckInterval => "Check interval must be between 1 and 1440 minutes.",
         _ => "",
     };
 

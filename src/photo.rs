@@ -21,6 +21,8 @@ pub struct Camera {
 #[serde(default)]
 pub struct Asset {
     pub uuid: String,
+    #[serde(skip)]
+    pub revision: Option<String>,
     pub filename: String,
     pub title: Option<String>,
     pub description: Option<String>,
