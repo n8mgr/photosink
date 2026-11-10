@@ -57,6 +57,7 @@ fn move_unique(
     uuid: &str,
     hash: &str,
     preserve_existing: bool,
+    available: &dyn Fn(&Path) -> Result<bool>,
 ) -> Result<Placed> {
     let mut tmp = tempfile::TempPath::try_from_path(tmp)?;
     let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -74,6 +75,9 @@ fn move_unique(
             2 => dest.with_file_name(format!("{stem}_{id}_{version}{ext}")),
             _ => dest.with_file_name(format!("{stem}_{id}_{version}_{n}{ext}")),
         };
+        if !available(&candidate)? {
+            continue;
+        }
         match tmp.persist_noclobber(&candidate) {
             Ok(()) => {
                 return Ok(Placed::New(candidate.to_string_lossy().into_owned()));
@@ -243,7 +247,7 @@ impl<'a> Exporter<'a> {
         let placed =
             match self
                 .state
-                .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
+                .place(uuid, kind, hash, tmp, asset.revision.as_deref(), |_| {
                     Ok(None)
                 })? {
                 Some(placed) => placed,
@@ -252,9 +256,17 @@ impl<'a> Exporter<'a> {
                     let target = dir.join(kind.file_name(&stem, filename));
                     let preserve_existing = self.state.exported(uuid, kind)?.is_some();
                     self.state
-                        .place(uuid, kind, hash, tmp, asset.revision.as_deref(), || {
-                            move_unique(tmp, &target, uuid, hash, preserve_existing).map(Some)
-                        })?
+                        .place(
+                            uuid,
+                            kind,
+                            hash,
+                            tmp,
+                            asset.revision.as_deref(),
+                            |available| {
+                                move_unique(tmp, &target, uuid, hash, preserve_existing, available)
+                                    .map(Some)
+                            },
+                        )?
                         .context("missing placement")?
                 }
             };
@@ -464,8 +476,11 @@ pub(crate) fn stored_asset(
             continue;
         }
         if let Ok(Some(packet)) = crate::photo::embed::read(Path::new(&path))
-            && let Some(asset) = crate::photo::xmp::read(&String::from_utf8_lossy(&packet))
+            && let Some(mut asset) = crate::photo::xmp::read(&String::from_utf8_lossy(&packet))
         {
+            if let Some(taken) = state.get(&format!("taken:{uuid}"))? {
+                asset.taken = chrono::DateTime::parse_from_rfc3339(&taken).ok();
+            }
             return Ok(Some(asset));
         }
     }
@@ -603,14 +618,14 @@ mod tests {
         let dest = dir.path().join("destination");
         std::fs::write(&src, b"original").unwrap();
         let hash = blake3::hash(b"original").to_hex().to_string();
-        move_unique(&src, &dest, "uuid", &hash, false).unwrap();
+        move_unique(&src, &dest, "uuid", &hash, false, &|_| Ok(true)).unwrap();
         assert!(!src.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"original");
         std::fs::write(&src, b"replacement").unwrap();
         let hash = blake3::hash(b"replacement").to_hex().to_string();
         let replacement = dir.path().join("destination_uuid");
         assert_eq!(
-            move_unique(&src, &dest, "uuid", &hash, false).unwrap(),
+            move_unique(&src, &dest, "uuid", &hash, false, &|_| Ok(true)).unwrap(),
             Placed::New(replacement.to_string_lossy().into_owned())
         );
         assert!(!src.exists());
@@ -626,14 +641,14 @@ mod tests {
         std::fs::write(&tmp, b"same").unwrap();
         let hash = blake3::hash(b"same").to_hex().to_string();
         assert_eq!(
-            move_unique(&tmp, &dest, "uuid1234", &hash, false).unwrap(),
+            move_unique(&tmp, &dest, "uuid1234", &hash, false, &|_| Ok(true)).unwrap(),
             Placed::Duplicate(dest.to_string_lossy().into_owned())
         );
         assert!(!tmp.exists());
         std::fs::write(&tmp, b"other").unwrap();
         let other = blake3::hash(b"other").to_hex().to_string();
         assert_eq!(
-            move_unique(&tmp, &dest, "uuid1234", &other, false).unwrap(),
+            move_unique(&tmp, &dest, "uuid1234", &other, false, &|_| Ok(true)).unwrap(),
             Placed::New(
                 dir.path()
                     .join("IMG_1_uuid1234.jpg")
@@ -1114,6 +1129,52 @@ mod tests {
         assert_eq!(std::fs::read(&current).unwrap(), b"new");
         assert_eq!(std::fs::read(shared).unwrap(), b"shared");
         assert_eq!(std::fs::read(unrelated).unwrap(), b"new");
+    }
+
+    #[test]
+    fn changed_content_does_not_reuse_missing_shared_or_historical_paths() {
+        for historical in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let cfg = revision_config(root.path());
+            let state = State::open(&root.path().join("state.sqlite")).unwrap();
+            let mut src = Changing {
+                bytes: b"old",
+                writes: AtomicUsize::new(0),
+                fail: false,
+            };
+            assert_eq!(run_revision(&src, &cfg, &state, "1", false).exported, 1);
+            let shared = state.exported("A", Kind::Original).unwrap().unwrap();
+            let old_hash = blake3::hash(b"old").to_hex().to_string();
+            state
+                .record("B", Kind::Original, &old_hash, &shared)
+                .unwrap();
+            state.baseline_revision("B", Kind::Original, "1").unwrap();
+            if historical {
+                let other = root.path().join("other.jpg");
+                std::fs::write(&other, b"other").unwrap();
+                state
+                    .record("B", Kind::Original, "other-hash", &other.to_string_lossy())
+                    .unwrap();
+                state.forget_export("A", Kind::Original, &shared).unwrap();
+            }
+            std::fs::remove_file(&shared).unwrap();
+            src.bytes = b"new";
+            assert_eq!(run_revision(&src, &cfg, &state, "2", false).exported, 1);
+            let current = state.exported("A", Kind::Original).unwrap().unwrap();
+            assert_ne!(current, shared);
+            assert!(!Path::new(&shared).exists());
+            assert!(state.duplicate(&old_hash).unwrap().is_none());
+            src.bytes = b"old";
+            let uuid = if historical { "C" } else { "B" };
+            let mut a = asset(uuid, "IMG_1.jpg", "");
+            a.revision = Some("1".into());
+            let mut ex = Exporter::new(&cfg, &state, &|_| {}, false);
+            ex.asset(&src, &a, uuid).unwrap();
+            assert_eq!(ex.finish().skipped, 0);
+            let restored = state.duplicate(&old_hash).unwrap().unwrap();
+            assert_eq!(std::fs::read(restored).unwrap(), b"old");
+            assert_eq!(std::fs::read(current).unwrap(), b"new");
+        }
     }
 
     #[test]

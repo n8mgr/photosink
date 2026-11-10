@@ -391,6 +391,56 @@ mod tests {
     }
 
     #[test]
+    fn historical_metadata_keeps_saved_date_after_current_media_is_deleted() {
+        let mut f = Fixture::new();
+        f.cfg.embed = true;
+        f.cfg.sidecar = false;
+        f.seed("A", "IMG_1", &tiff_dated("2016:11:28 10:00:00"), false);
+        let asset = crate::photo::Asset {
+            uuid: "A".into(),
+            filename: "IMG_1.tif".into(),
+            taken: DateTime::parse_from_rfc3339("2016-11-28T10:00:00+01:00").ok(),
+            ..Default::default()
+        };
+        let original = f.dir("2016").join("IMG_1.tif");
+        crate::photo::embed::embed(&original, &crate::photo::xmp::write(&asset)).unwrap();
+        let current = f.dir("2016").join("IMG_1_A.tif");
+        std::fs::copy(&original, &current).unwrap();
+        f.state
+            .record(
+                "A",
+                crate::sources::Kind::Original,
+                "new",
+                &current.to_string_lossy(),
+            )
+            .unwrap();
+        let choices = [Choice {
+            uuid: "A".into(),
+            taken: at("2008-09-22 18:48:43"),
+        }];
+        assert_eq!(apply(&f.cfg, &f.state, &choices, &|_| {}).unwrap().moved, 1);
+        std::fs::remove_file(f.dir("2008").join("IMG_1_A.tif")).unwrap();
+        crate::clean::run(&f.cfg, &f.state, false, &|_| {}, false).unwrap();
+        let moved = consolidate::run(&f.cfg, &f.state, &|_| {}, false).unwrap();
+        assert_eq!((moved.moved, moved.unchanged), (0, 1));
+        assert!(f.dir("2008").join("IMG_1.tif").exists());
+        let stored =
+            crate::export::stored_asset(&f.state, &f.dir("2008").to_string_lossy(), "IMG_1", "A")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            stored.taken.unwrap().to_rfc3339(),
+            "2008-09-22T18:48:43+01:00"
+        );
+        let events = collect(|p| scan(&f.cfg, &f.state, Some("IMG_1"), p).unwrap());
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Flagged(c) if c.current == Some(choices[0].taken)))
+        );
+    }
+
+    #[test]
     fn apply_skips_failures_and_still_moves_the_rest() {
         let f = Fixture::new();
         f.seed("A", "IMG_1", b"a", true);

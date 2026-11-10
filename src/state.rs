@@ -30,8 +30,10 @@ impl State {
              DROP INDEX IF EXISTS assets_stem;
              CREATE TABLE IF NOT EXISTS exports (uuid TEXT NOT NULL, kind TEXT NOT NULL, hash TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (uuid, kind));
              CREATE INDEX IF NOT EXISTS exports_hash ON exports (hash);
+             CREATE INDEX IF NOT EXISTS exports_path ON exports (path COLLATE photosink_path);
              CREATE TABLE IF NOT EXISTS export_history (uuid TEXT NOT NULL, kind TEXT NOT NULL, hash TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY (uuid, kind, path));
              CREATE INDEX IF NOT EXISTS export_history_hash ON export_history (hash);
+             CREATE INDEX IF NOT EXISTS export_history_path ON export_history (path COLLATE photosink_path);
              CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
         Ok(State {
@@ -259,7 +261,7 @@ impl State {
         hash: &str,
         tmp: &Path,
         revision: Option<&str>,
-        dest: impl FnOnce() -> Result<Option<Placed>>,
+        dest: impl FnOnce(&dyn Fn(&Path) -> Result<bool>) -> Result<Option<Placed>>,
     ) -> Result<Option<Placed>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -268,7 +270,16 @@ impl State {
                 std::fs::remove_file(tmp)?;
                 Placed::Duplicate(path)
             }
-            None => match dest()? {
+            None => match dest(&|path| {
+                Ok(!tx.query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM exports WHERE path = ?1 COLLATE photosink_path AND hash != ?2
+                        UNION ALL SELECT 1 FROM export_history WHERE path = ?1 COLLATE photosink_path AND hash != ?2
+                     )",
+                    params![path.to_string_lossy(), hash],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })? {
                 Some(placed) => placed,
                 None => return Ok(None),
             },
@@ -367,7 +378,7 @@ mod tests {
         assert_eq!(s.duplicate("h").unwrap(), None);
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("u", Kind::Original, "h", &tmp, None, || mv(&dest))
+            s.place("u", Kind::Original, "h", &tmp, None, |_| mv(&dest))
                 .unwrap(),
             Some(Placed::New(dest.to_string_lossy().into_owned()))
         );
@@ -380,7 +391,7 @@ mod tests {
         assert_eq!(s.duplicate("h").unwrap().as_deref(), dest.to_str());
         std::fs::write(&tmp, b"a").unwrap();
         assert_eq!(
-            s.place("v", Kind::Original, "h", &tmp, None, || unreachable!())
+            s.place("v", Kind::Original, "h", &tmp, None, |_| unreachable!())
                 .unwrap(),
             Some(Placed::Duplicate(dest.to_string_lossy().into_owned()))
         );
@@ -397,7 +408,7 @@ mod tests {
         let new = dir.path().join("new.jpg");
         std::fs::write(&tmp, b"old").unwrap();
         state
-            .place("u", Kind::Original, "old", &tmp, Some("1"), || {
+            .place("u", Kind::Original, "old", &tmp, Some("1"), |_| {
                 std::fs::rename(&tmp, &old)?;
                 Ok(Some(Placed::New(old.to_string_lossy().into_owned())))
             })
@@ -405,7 +416,7 @@ mod tests {
         std::fs::write(&tmp, b"new").unwrap();
         assert!(
             state
-                .place("u", Kind::Original, "new", &tmp, Some("2"), || {
+                .place("u", Kind::Original, "new", &tmp, Some("2"), |_| {
                     anyhow::bail!("placement failed")
                 })
                 .is_err()
@@ -419,7 +430,7 @@ mod tests {
             old.to_str()
         );
         state
-            .place("u", Kind::Original, "new", &tmp, None, || {
+            .place("u", Kind::Original, "new", &tmp, None, |_| {
                 std::fs::rename(&tmp, &new)?;
                 Ok(Some(Placed::New(new.to_string_lossy().into_owned())))
             })
@@ -440,7 +451,7 @@ mod tests {
         std::fs::write(&tmp, b"old").unwrap();
         assert_eq!(
             state
-                .place("u", Kind::Original, "old", &tmp, Some("1"), || Ok(None))
+                .place("u", Kind::Original, "old", &tmp, Some("1"), |_| Ok(None))
                 .unwrap(),
             None
         );
@@ -472,7 +483,7 @@ mod tests {
                     "old",
                     &tmp,
                     Some("1"),
-                    || unreachable!()
+                    |_| unreachable!()
                 )
                 .unwrap(),
             Some(Placed::Duplicate(old.clone()))

@@ -46,6 +46,10 @@ pub(crate) fn authorize(auth: AuthMode) -> Result<()> {
     }
 }
 
+fn revision(modified: Option<f64>) -> String {
+    modified.map_or_else(|| "unmodified".into(), |date| date.to_string())
+}
+
 pub(crate) fn list_assets() -> Vec<(String, String, Option<String>)> {
     let result = unsafe { PHAsset::fetchAssetsWithOptions(None) };
     (0..unsafe { result.count() })
@@ -53,9 +57,10 @@ pub(crate) fn list_assets() -> Vec<(String, String, Option<String>)> {
             let asset = unsafe { result.objectAtIndex(i) };
             let id = unsafe { asset.localIdentifier() }.to_string();
             let uuid = id.split('/').next().unwrap_or("").to_owned();
-            let revision = unsafe { asset.modificationDate() }
-                .map(|date| date.timeIntervalSince1970().to_string());
-            (uuid, id, revision)
+            let revision = revision(
+                unsafe { asset.modificationDate() }.map(|date| date.timeIntervalSince1970()),
+            );
+            (uuid, id, Some(revision))
         })
         .collect()
 }
@@ -115,6 +120,51 @@ pub(crate) fn write_resource(local_id: &str, index: usize, dest: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_edit_after_missing_modification_date_is_exported() {
+        struct Bytes(&'static [u8]);
+        impl crate::sources::Source for Bytes {
+            fn write(&self, _: &str, _: usize, dest: &Path) -> Result<String> {
+                crate::export::write_hashed(self.0, dest)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::parse(&format!(
+            "export_dir = {}\nembed = false\nsidecar = false",
+            toml::Value::String(root.path().join("out").to_string_lossy().into_owned())
+        ))
+        .unwrap();
+        let state = crate::state::State::open(&root.path().join("state.sqlite")).unwrap();
+        let mut original = None;
+        for (modified, bytes, counts) in [
+            (None, b"original".as_slice(), (1, 0)),
+            (None, b"original".as_slice(), (0, 1)),
+            (Some(1_000.0), b"edited".as_slice(), (1, 0)),
+        ] {
+            let asset = crate::photo::Asset {
+                uuid: "A".into(),
+                filename: "IMG_1.jpg".into(),
+                revision: Some(revision(modified)),
+                ..Default::default()
+            };
+            let result = crate::export::run(
+                &Bytes(bytes),
+                &cfg,
+                &state,
+                &std::collections::HashMap::from([("A".into(), asset)]),
+                &[("A".into(), "A".into())],
+                &|_| {},
+                false,
+            );
+            assert_eq!((result.exported, result.skipped), counts);
+            assert_eq!(result.errors, 0);
+            let path = state.exported("A", Kind::Original).unwrap().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            original.get_or_insert(path);
+        }
+        assert_eq!(std::fs::read(original.unwrap()).unwrap(), b"original");
+    }
 
     #[test]
     fn maps_resource_types() {
