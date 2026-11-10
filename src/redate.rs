@@ -35,13 +35,13 @@ pub struct Choice {
 }
 
 fn media_file(state: &State, uuid: &str) -> Result<Option<String>> {
-    if let Some(p) = state.exported(uuid, crate::sources::Kind::Original)? {
-        return Ok(Some(p));
-    }
-    Ok(state
-        .exports_of(uuid)?
+    let mut exports = state.stored_exports_of(uuid)?;
+    exports.sort_by_key(|(kind, _)| *kind != crate::sources::Kind::Original);
+    Ok(exports
         .into_iter()
-        .find(|(kind, _)| *kind != crate::sources::Kind::Adjustments)
+        .find(|(kind, path)| {
+            *kind != crate::sources::Kind::Adjustments && Path::new(path).is_file()
+        })
         .map(|(_, p)| p))
 }
 
@@ -345,6 +345,49 @@ mod tests {
             ["C"],
             "a query lists matches unflagged too"
         );
+    }
+
+    #[test]
+    fn history_only_embedded_asset_can_be_scanned_redated_and_consolidated() {
+        let mut f = Fixture::new();
+        f.cfg.embed = true;
+        f.cfg.sidecar = false;
+        f.seed("A", "IMG_1", &tiff_dated("2008:09:22 18:48:43"), false);
+        let asset = crate::photo::Asset {
+            uuid: "A".into(),
+            filename: "IMG_1.tif".into(),
+            taken: DateTime::parse_from_rfc3339("2016-11-28T10:00:00+00:00").ok(),
+            ..Default::default()
+        };
+        let file = f.dir("2016").join("IMG_1.tif");
+        crate::photo::embed::embed(&file, &crate::photo::xmp::write(&asset)).unwrap();
+        f.state
+            .record(
+                "A",
+                crate::sources::Kind::Original,
+                "new",
+                &f.dir("2016").join("IMG_1_A.tif").to_string_lossy(),
+            )
+            .unwrap();
+        let events = collect(|p| scan(&f.cfg, &f.state, None, p).unwrap());
+        assert_eq!(flagged(&events), ["A"]);
+        crate::clean::run(&f.cfg, &f.state, false, &|_| {}, false).unwrap();
+        assert!(f.state.exports_of("A").unwrap().is_empty());
+        let events = collect(|p| scan(&f.cfg, &f.state, None, p).unwrap());
+        assert_eq!(flagged(&events), ["A"]);
+        let choices = [Choice {
+            uuid: "A".into(),
+            taken: at("2008-09-22 18:48:43"),
+        }];
+        let moved = apply(&f.cfg, &f.state, &choices, &|_| {}).unwrap();
+        assert_eq!(moved.moved, 1);
+        assert!(!file.exists());
+        assert!(f.dir("2008").join("IMG_1.tif").exists());
+        let stored =
+            crate::export::stored_asset(&f.state, &f.dir("2008").to_string_lossy(), "IMG_1", "A")
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.taken.unwrap().naive_local(), choices[0].taken);
     }
 
     #[test]

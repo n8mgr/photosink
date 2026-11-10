@@ -327,10 +327,13 @@ final class Delegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        model?.settings?.keepRunningAfterClose != true
+        guard model?.settings?.keepRunningAfterClose == true else { return true }
+        sender.setActivationPolicy(.accessory)
+        return false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        sender.setActivationPolicy(.regular)
         if !hasVisibleWindows {
             openMainWindow?()
             return false
@@ -346,10 +349,12 @@ struct BackgroundMenu: View {
 
     var body: some View {
         Button("Open Photosink") {
+            NSApp.setActivationPolicy(.regular)
             openWindow(id: "main")
             NSApp.activate()
         }
         Button("Settings…") {
+            NSApp.setActivationPolicy(.regular)
             openSettings()
             NSApp.activate()
         }

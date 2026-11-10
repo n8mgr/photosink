@@ -124,6 +124,16 @@ impl State {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub(crate) fn stored_exports_of(&self, uuid: &str) -> Result<Vec<(Kind, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT kind, path FROM exports WHERE uuid = ?1
+             UNION ALL SELECT kind, path FROM export_history WHERE uuid = ?1",
+        )?;
+        let rows = stmt.query_map([uuid], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub(crate) fn relocate(
         &self,
         uuid: &str,
@@ -137,14 +147,24 @@ impl State {
             "UPDATE assets SET dir = ?, stem = ? WHERE uuid = ?",
             [dir, stem, uuid],
         )?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE relocation_paths (old TEXT PRIMARY KEY, new TEXT NOT NULL);",
+        )?;
         for (old, path) in paths {
-            // Content duplicates of this asset point at the same file.
-            tx.execute("UPDATE exports SET path = ? WHERE path = ?", [path, old])?;
-            tx.execute(
-                "UPDATE export_history SET path = ? WHERE path = ?",
-                [path, old],
-            )?;
+            tx.execute("INSERT INTO relocation_paths VALUES (?, ?)", [old, path])?;
         }
+        // Content duplicates of this asset point at the same file.
+        tx.execute_batch(
+            "CREATE TEMP TABLE relocated_history AS
+                 SELECT uuid, kind, hash, new AS path FROM export_history
+                 JOIN relocation_paths ON path = old;
+             UPDATE exports SET path = (SELECT new FROM relocation_paths WHERE old = path)
+                 WHERE path IN (SELECT old FROM relocation_paths);
+             DELETE FROM export_history WHERE path IN (SELECT old FROM relocation_paths);
+             INSERT INTO export_history SELECT uuid, kind, hash, path FROM relocated_history;
+             DROP TABLE relocated_history;
+             DROP TABLE relocation_paths;",
+        )?;
         tx.commit()?;
         Ok(())
     }
