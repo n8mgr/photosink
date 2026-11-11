@@ -23,7 +23,7 @@ chrono = "0.4"
 photosink = { path = ".." }
 thiserror = "2"
 toml = "1"
-uniffi = "0.31"
+uniffi = "0.32"
 
 [dev-dependencies]
 tempfile = "3"
